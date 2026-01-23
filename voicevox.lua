@@ -20,6 +20,8 @@ local FILES = {
     modified = CONFIG.TEMP_DIR .. "sing_modified.json",
     output = CONFIG.TEMP_DIR .. "voicevox_sing_output.wav",
     list = CONFIG.TEMP_DIR .. "voicevox_list.json",
+    last_singer = CONFIG.TEMP_DIR .. "voicevox_last_singer.txt",
+    last_speaker = CONFIG.TEMP_DIR .. "voicevox_last_speaker.txt",
 }
 
 --------------------------------------------------------------------------------
@@ -117,12 +119,48 @@ local function show_menu(items)
     return choice
 end
 
-local function select_character_and_style(characters, title)
+local function find_character_by_id(characters, id)
+    for _, char in ipairs(characters) do
+        for _, style in ipairs(char.styles) do
+            if style.id == id then
+                return char.name, style.name
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function load_last_selection(file_path)
+    local content = read_file(file_path)
+    if content then
+        return tonumber(content)
+    end
+    return nil
+end
+
+local function save_last_selection(file_path, id)
+    write_file(file_path, tostring(id))
+end
+
+local function select_character_and_style(characters, title, last_file, force_select)
     if #characters == 0 then
         log("エラー: キャラクターが見つかりません")
         return nil
     end
 
+    -- 前回選択を確認（強制選択でない場合）
+    if not force_select then
+        local last_id = load_last_selection(last_file)
+        if last_id then
+            local last_char_name, last_style_name = find_character_by_id(characters, last_id)
+            if last_char_name then
+                log(string.format("%s: %s - %s (ID: %d)", title, last_char_name, last_style_name, last_id))
+                return last_id
+            end
+        end
+    end
+
+    -- キャラクター選択メニュー
     -- 1. キャラクター選択
     local char_names = {}
     for _, c in ipairs(characters) do
@@ -140,25 +178,30 @@ local function select_character_and_style(characters, title)
     log("選択: " .. char.name)
 
     -- 2. スタイル選択（複数ある場合）
+    local selected_id
     if #char.styles == 1 then
-        log("スタイル: " .. char.styles[1].name .. " (ID: " .. char.styles[1].id .. ")")
-        return char.styles[1].id
+        selected_id = char.styles[1].id
+        log("スタイル: " .. char.styles[1].name .. " (ID: " .. selected_id .. ")")
+    else
+        local style_names = {}
+        for _, s in ipairs(char.styles) do
+            table.insert(style_names, s.name)
+        end
+
+        log("スタイルを選択してください...")
+        local style_choice = show_menu(style_names)
+        if style_choice == 0 then
+            log("キャンセルされました")
+            return nil
+        end
+
+        selected_id = char.styles[style_choice].id
+        log("スタイル: " .. char.styles[style_choice].name .. " (ID: " .. selected_id .. ")")
     end
 
-    local style_names = {}
-    for _, s in ipairs(char.styles) do
-        table.insert(style_names, s.name)
-    end
-
-    log("スタイルを選択してください...")
-    local style_choice = show_menu(style_names)
-    if style_choice == 0 then
-        log("キャンセルされました")
-        return nil
-    end
-
-    log("スタイル: " .. char.styles[style_choice].name .. " (ID: " .. char.styles[style_choice].id .. ")")
-    return char.styles[style_choice].id
+    -- 選択を保存
+    save_last_selection(last_file, selected_id)
+    return selected_id
 end
 
 --------------------------------------------------------------------------------
@@ -389,6 +432,9 @@ end
 -- メイン処理
 --------------------------------------------------------------------------------
 
+-- 外部から設定可能なフラグ
+VOICEVOX_FORCE_SELECT = VOICEVOX_FORCE_SELECT or false
+
 local function main()
     log("=== VOICEVOX歌唱合成 ===")
 
@@ -429,7 +475,7 @@ local function main()
         log("シンガー一覧を取得中...")
         local singers_json = fetch_voicevox_list("singers")
         local singers = parse_characters(singers_json)
-        local synth_speaker = select_character_and_style(singers, "シンガー")
+        local synth_speaker = select_character_and_style(singers, "シンガー", FILES.last_singer, VOICEVOX_FORCE_SELECT)
         if not synth_speaker then return end
 
         local json_body = build_notes_json(notes, lyrics, bpm, ppq_per_qn)
@@ -452,7 +498,7 @@ local function main()
         log("スピーカー一覧を取得中...")
         local speakers_json = fetch_voicevox_list("speakers")
         local speakers = parse_characters(speakers_json)
-        local talk_speaker = select_character_and_style(speakers, "スピーカー")
+        local talk_speaker = select_character_and_style(speakers, "スピーカー", FILES.last_speaker, VOICEVOX_FORCE_SELECT)
         if not talk_speaker then return end
 
         if not call_voicevox_talk(item_name, FILES.output, talk_speaker) then
