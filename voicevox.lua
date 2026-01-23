@@ -248,8 +248,11 @@ end
 -- フレーム・時間変換
 --------------------------------------------------------------------------------
 
-local function ppq_to_frames(ppq, bpm, ppq_per_qn)
-    local seconds = ppq / ppq_per_qn * (60 / bpm)
+local function ppq_to_seconds(ppq, bpm, ppq_per_qn)
+    return ppq / ppq_per_qn * (60 / bpm)
+end
+
+local function seconds_to_frames(seconds)
     return math.max(math.floor(seconds * CONFIG.FRAME_RATE + 0.5), 1)
 end
 
@@ -270,23 +273,39 @@ local function build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
         CONFIG.REST_FRAMES
     ))
 
+    -- 最初のノートの開始位置を基準点とする
+    local base_ppq = notes[1].startppq
+    local prev_frame = 0  -- 基準点からの累積フレーム位置
+
     for i, note in ipairs(notes) do
-        -- ノート間の休符
+        -- ノート開始位置のフレーム（基準点からの累積）
+        local note_start_sec = ppq_to_seconds(note.startppq - base_ppq, bpm, ppq_per_qn)
+        local note_start_frame = seconds_to_frames(note_start_sec)
+        if i == 1 then note_start_frame = 0 end  -- 最初のノートは基準点
+
+        -- ノート間の休符（累積フレームの差として計算）
         if i > 1 then
-            local gap = note.startppq - notes[i - 1].endppq
-            if gap > 0 then
+            local gap_frames = note_start_frame - prev_frame
+            if gap_frames > 0 then
                 table.insert(parts, string.format(
                     '{"id":"rest%d","key":null,"frame_length":%d,"lyric":""}',
-                    i, ppq_to_frames(gap, bpm, ppq_per_qn)
+                    i, gap_frames
                 ))
             end
         end
 
+        -- ノート終了位置のフレーム（基準点からの累積）
+        local note_end_sec = ppq_to_seconds(note.endppq - base_ppq, bpm, ppq_per_qn)
+        local note_end_frame = seconds_to_frames(note_end_sec)
+        local note_frames = math.max(note_end_frame - note_start_frame, 1)
+
         -- ノート
         table.insert(parts, string.format(
             '{"id":"note%d","key":%d,"frame_length":%d,"lyric":"%s"}',
-            i, note.pitch, ppq_to_frames(note.length, bpm, ppq_per_qn), lyrics[i] or "ん"
+            i, note.pitch, note_frames, lyrics[i] or "ん"
         ))
+
+        prev_frame = note_end_frame
     end
 
     -- 終了休符
