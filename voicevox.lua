@@ -349,7 +349,13 @@ local function main()
         table.insert(selected_items, reaper.GetSelectedMediaItem(0, i))
     end
 
-    insert_wav(FILES.output, item_start, target_track, is_sing, selected_items)
+    -- 歌唱モードの場合、最初のノートの位置を基準にする
+    local insert_position = item_start
+    if is_sing and #notes > 0 then
+        insert_position = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
+    end
+
+    insert_wav(FILES.output, insert_position, target_track, is_sing, selected_items)
 
     log("完了！")
 end
