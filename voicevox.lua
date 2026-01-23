@@ -18,7 +18,6 @@ local FILES = {
     query = CONFIG.TEMP_DIR .. "sing_query.json",
     response = CONFIG.TEMP_DIR .. "sing_response.json",
     modified = CONFIG.TEMP_DIR .. "sing_modified.json",
-    output = CONFIG.TEMP_DIR .. "voicevox_sing_output.wav",
     list = CONFIG.TEMP_DIR .. "voicevox_list.json",
     last_singer = CONFIG.TEMP_DIR .. "voicevox_last_singer.txt",
     last_speaker = CONFIG.TEMP_DIR .. "voicevox_last_speaker.txt",
@@ -145,7 +144,7 @@ end
 local function select_character_and_style(characters, title, last_file, force_select)
     if #characters == 0 then
         log("エラー: キャラクターが見つかりません")
-        return nil
+        return nil, nil, nil
     end
 
     -- 前回選択を確認（強制選択でない場合）
@@ -155,7 +154,7 @@ local function select_character_and_style(characters, title, last_file, force_se
             local last_char_name, last_style_name = find_character_by_id(characters, last_id)
             if last_char_name then
                 log(string.format("%s: %s - %s (ID: %d)", title, last_char_name, last_style_name, last_id))
-                return last_id
+                return last_id, last_char_name, last_style_name
             end
         end
     end
@@ -171,17 +170,18 @@ local function select_character_and_style(characters, title, last_file, force_se
     local char_choice = show_menu(char_names)
     if char_choice == 0 then
         log("キャンセルされました")
-        return nil
+        return nil, nil, nil
     end
 
     local char = characters[char_choice]
     log("選択: " .. char.name)
 
     -- 2. スタイル選択（複数ある場合）
-    local selected_id
+    local selected_id, selected_style_name
     if #char.styles == 1 then
         selected_id = char.styles[1].id
-        log("スタイル: " .. char.styles[1].name .. " (ID: " .. selected_id .. ")")
+        selected_style_name = char.styles[1].name
+        log("スタイル: " .. selected_style_name .. " (ID: " .. selected_id .. ")")
     else
         local style_names = {}
         for _, s in ipairs(char.styles) do
@@ -192,16 +192,17 @@ local function select_character_and_style(characters, title, last_file, force_se
         local style_choice = show_menu(style_names)
         if style_choice == 0 then
             log("キャンセルされました")
-            return nil
+            return nil, nil, nil
         end
 
         selected_id = char.styles[style_choice].id
-        log("スタイル: " .. char.styles[style_choice].name .. " (ID: " .. selected_id .. ")")
+        selected_style_name = char.styles[style_choice].name
+        log("スタイル: " .. selected_style_name .. " (ID: " .. selected_id .. ")")
     end
 
     -- 選択を保存
     save_last_selection(last_file, selected_id)
-    return selected_id
+    return selected_id, char.name, selected_style_name
 end
 
 --------------------------------------------------------------------------------
@@ -466,6 +467,7 @@ local function main()
     local notes = get_midi_notes(take)
     local is_sing = #notes > 0
 
+    local output_path
     if is_sing then
         -- 歌唱モード
         local lyrics = split_lyrics(item_name)
@@ -475,8 +477,10 @@ local function main()
         log("シンガー一覧を取得中...")
         local singers_json = fetch_voicevox_list("singers")
         local singers = parse_characters(singers_json)
-        local synth_speaker = select_character_and_style(singers, "シンガー", FILES.last_singer, VOICEVOX_FORCE_SELECT)
+        local synth_speaker, singer_name, style_name = select_character_and_style(singers, "シンガー", FILES.last_singer, VOICEVOX_FORCE_SELECT)
         if not synth_speaker then return end
+
+        output_path = string.format("%svoicevox_%s_%s.wav", CONFIG.TEMP_DIR, singer_name, style_name)
 
         local json_body = build_notes_json(notes, lyrics, bpm, ppq_per_qn)
         log("送信JSON: " .. json_body)
@@ -489,7 +493,7 @@ local function main()
         end
 
         log("WAV生成中...")
-        call_voicevox_synthesis(FILES.output, synth_speaker)
+        call_voicevox_synthesis(output_path, synth_speaker)
     else
         -- トークモード
         log("トークモード: " .. item_name)
@@ -498,10 +502,12 @@ local function main()
         log("スピーカー一覧を取得中...")
         local speakers_json = fetch_voicevox_list("speakers")
         local speakers = parse_characters(speakers_json)
-        local talk_speaker = select_character_and_style(speakers, "スピーカー", FILES.last_speaker, VOICEVOX_FORCE_SELECT)
+        local talk_speaker, speaker_name, style_name = select_character_and_style(speakers, "スピーカー", FILES.last_speaker, VOICEVOX_FORCE_SELECT)
         if not talk_speaker then return end
 
-        if not call_voicevox_talk(item_name, FILES.output, talk_speaker) then
+        output_path = string.format("%svoicevox_%s_%s.wav", CONFIG.TEMP_DIR, speaker_name, style_name)
+
+        if not call_voicevox_talk(item_name, output_path, talk_speaker) then
             log("エラー: トーク生成に失敗しました")
             return
         end
@@ -525,7 +531,7 @@ local function main()
         insert_position = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
     end
 
-    insert_wav(FILES.output, insert_position, target_track, is_sing, selected_items)
+    insert_wav(output_path, insert_position, target_track, is_sing, selected_items)
 
     log("完了！")
 end
