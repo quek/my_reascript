@@ -27,8 +27,14 @@ local FILES = {
 -- ユーティリティ関数
 --------------------------------------------------------------------------------
 
+local log_buffer = {}
+
 local function log(msg)
-    reaper.ShowConsoleMsg(msg .. "\n")
+    table.insert(log_buffer, msg)
+end
+
+local function show_log()
+    reaper.ShowConsoleMsg(table.concat(log_buffer, "\n") .. "\n")
 end
 
 local function read_file(path)
@@ -443,20 +449,20 @@ local function main()
     local item = reaper.GetSelectedMediaItem(0, 0)
     if not item then
         log("エラー: MIDIアイテムを選択してください")
-        return
+        return false
     end
 
     local take = reaper.GetActiveTake(item)
     if not take then
         log("エラー: アクティブテイクがありません")
-        return
+        return false
     end
 
     -- アイテム名から歌詞取得
     local _, item_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
     if item_name == "" then
         log("エラー: アイテム名（歌詞）が空です")
-        return
+        return false
     end
 
     -- プロジェクト情報取得
@@ -478,7 +484,7 @@ local function main()
         local singers_json = fetch_voicevox_list("singers")
         local singers = parse_characters(singers_json)
         local synth_speaker, singer_name, style_name = select_character_and_style(singers, "シンガー", FILES.last_singer, VOICEVOX_FORCE_SELECT)
-        if not synth_speaker then return end
+        if not synth_speaker then return end  -- キャンセル時はログ非表示
 
         output_path = string.format("%svoicevox_%s_%s.wav", CONFIG.TEMP_DIR, singer_name, style_name)
 
@@ -489,7 +495,7 @@ local function main()
         -- sing_frame_audio_query: 波音リツ(6000)固定
         if not call_voicevox_query(json_body, CONFIG.QUERY_SPEAKER) then
             log("エラー: 歌唱クエリ生成に失敗しました")
-            return
+            return false
         end
 
         log("WAV生成中...")
@@ -503,13 +509,13 @@ local function main()
         local speakers_json = fetch_voicevox_list("speakers")
         local speakers = parse_characters(speakers_json)
         local talk_speaker, speaker_name, style_name = select_character_and_style(speakers, "スピーカー", FILES.last_speaker, VOICEVOX_FORCE_SELECT)
-        if not talk_speaker then return end
+        if not talk_speaker then return end  -- キャンセル時はログ非表示
 
         output_path = string.format("%svoicevox_%s_%s.wav", CONFIG.TEMP_DIR, speaker_name, style_name)
 
         if not call_voicevox_talk(item_name, output_path, talk_speaker) then
             log("エラー: トーク生成に失敗しました")
-            return
+            return false
         end
     end
 
@@ -534,6 +540,10 @@ local function main()
     insert_wav(output_path, insert_position, target_track, is_sing, selected_items)
 
     log("完了！")
+    return true
 end
 
-main()
+-- エラー時のみログ表示
+if main() == false then
+    show_log()
+end
