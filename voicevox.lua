@@ -6,9 +6,7 @@
 -- 設定
 local CONFIG = {
     VOICEVOX_URL = "http://localhost:50021",
-    QUERY_SPEAKER = 6000,   -- 波音リツ（歌唱クエリ生成用）
-    SYNTH_SPEAKER = 3061,   -- 中国うさぎ（音声合成用）
-    TALK_SPEAKER = 61,      -- 中国うさぎ（トーク用）
+    QUERY_SPEAKER = 6000,   -- 波音リツ（歌唱クエリ生成用・固定）
     FRAME_RATE = 93.75,     -- 24000Hz / 256サンプル
     OUTPUT_SAMPLE_RATE = 48000,
     TEMP_DIR = "C:\\tmp\\",
@@ -21,6 +19,7 @@ local FILES = {
     response = CONFIG.TEMP_DIR .. "sing_response.json",
     modified = CONFIG.TEMP_DIR .. "sing_modified.json",
     output = CONFIG.TEMP_DIR .. "voicevox_sing_output.wav",
+    list = CONFIG.TEMP_DIR .. "voicevox_list.json",
 }
 
 --------------------------------------------------------------------------------
@@ -51,6 +50,115 @@ local function url_encode(str)
     return str:gsub("([^%w%-_%.~])", function(c)
         return string.format("%%%02X", string.byte(c))
     end)
+end
+
+--------------------------------------------------------------------------------
+-- キャラクター選択UI
+--------------------------------------------------------------------------------
+
+local function fetch_voicevox_list(endpoint)
+    local cmd = string.format(
+        'curl.exe -s "%s/%s" -o "%s"',
+        CONFIG.VOICEVOX_URL, endpoint, FILES.list
+    )
+    reaper.ExecProcess(cmd, 10000)
+    return read_file(FILES.list)
+end
+
+local function parse_characters(json)
+    if not json then return {} end
+
+    local characters = {}
+    -- キャラクター単位でパース（"styles":[ で区切る）
+    local pos = 1
+    while true do
+        -- 次のキャラクターブロックを探す
+        local name_start = json:find('"name":', pos)
+        if not name_start then break end
+
+        -- キャラクター名を取得
+        local char_name = json:match('"name":"([^"]+)"', name_start)
+        if not char_name then break end
+
+        -- stylesを探す
+        local styles_start = json:find('"styles":%s*%[', name_start)
+        if not styles_start then break end
+
+        -- stylesの終わりを探す
+        local styles_end = json:find('%]', styles_start)
+        if not styles_end then break end
+
+        local styles_json = json:sub(styles_start, styles_end)
+
+        -- スタイルをパース
+        local styles = {}
+        for style_block in styles_json:gmatch('%{[^%}]+%}') do
+            local style_name = style_block:match('"name":"([^"]+)"')
+            local style_id = style_block:match('"id":(%d+)')
+            if style_name and style_id then
+                table.insert(styles, {name = style_name, id = tonumber(style_id)})
+            end
+        end
+
+        if #styles > 0 then
+            table.insert(characters, {name = char_name, styles = styles})
+        end
+
+        pos = styles_end + 1
+    end
+
+    return characters
+end
+
+local function show_menu(items)
+    gfx.init("", 0, 0)
+    local choice = gfx.showmenu(table.concat(items, "|"))
+    gfx.quit()
+    return choice
+end
+
+local function select_character_and_style(characters, title)
+    if #characters == 0 then
+        log("エラー: キャラクターが見つかりません")
+        return nil
+    end
+
+    -- 1. キャラクター選択
+    local char_names = {}
+    for _, c in ipairs(characters) do
+        table.insert(char_names, c.name)
+    end
+
+    log(title .. "を選択してください...")
+    local char_choice = show_menu(char_names)
+    if char_choice == 0 then
+        log("キャンセルされました")
+        return nil
+    end
+
+    local char = characters[char_choice]
+    log("選択: " .. char.name)
+
+    -- 2. スタイル選択（複数ある場合）
+    if #char.styles == 1 then
+        log("スタイル: " .. char.styles[1].name .. " (ID: " .. char.styles[1].id .. ")")
+        return char.styles[1].id
+    end
+
+    local style_names = {}
+    for _, s in ipairs(char.styles) do
+        table.insert(style_names, s.name)
+    end
+
+    log("スタイルを選択してください...")
+    local style_choice = show_menu(style_names)
+    if style_choice == 0 then
+        log("キャンセルされました")
+        return nil
+    end
+
+    log("スタイル: " .. char.styles[style_choice].name .. " (ID: " .. char.styles[style_choice].id .. ")")
+    return char.styles[style_choice].id
 end
 
 --------------------------------------------------------------------------------
@@ -159,13 +267,13 @@ end
 -- VOICEVOX API
 --------------------------------------------------------------------------------
 
-local function call_voicevox_query(json_body)
+local function call_voicevox_query(json_body, query_speaker)
     write_file(FILES.query, json_body)
 
     local cmd = string.format(
         'curl.exe -s -X POST "%s/sing_frame_audio_query?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
         CONFIG.VOICEVOX_URL,
-        CONFIG.QUERY_SPEAKER,
+        query_speaker,
         FILES.query,
         FILES.response
     )
@@ -186,11 +294,11 @@ local function call_voicevox_query(json_body)
     return true
 end
 
-local function call_voicevox_synthesis(output_path)
+local function call_voicevox_synthesis(output_path, synth_speaker)
     local cmd = string.format(
         'curl.exe -s -X POST "%s/frame_synthesis?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
         CONFIG.VOICEVOX_URL,
-        CONFIG.SYNTH_SPEAKER,
+        synth_speaker,
         FILES.modified,
         output_path
     )
@@ -198,12 +306,12 @@ local function call_voicevox_synthesis(output_path)
     return true
 end
 
-local function call_voicevox_talk(text, output_path)
+local function call_voicevox_talk(text, output_path, talk_speaker)
     -- audio_query
     local cmd = string.format(
         'curl.exe -s -X POST "%s/audio_query?speaker=%d&text=%s" -o "%s"',
         CONFIG.VOICEVOX_URL,
-        CONFIG.TALK_SPEAKER,
+        talk_speaker,
         url_encode(text),
         FILES.response
     )
@@ -225,7 +333,7 @@ local function call_voicevox_talk(text, output_path)
     cmd = string.format(
         'curl.exe -s -X POST "%s/synthesis?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
         CONFIG.VOICEVOX_URL,
-        CONFIG.TALK_SPEAKER,
+        talk_speaker,
         FILES.modified,
         output_path
     )
@@ -317,21 +425,37 @@ local function main()
         local lyrics = split_lyrics(item_name)
         log(string.format("ノート数: %d, 歌詞: %s", #notes, table.concat(lyrics, "")))
 
+        -- シンガー選択
+        log("シンガー一覧を取得中...")
+        local singers_json = fetch_voicevox_list("singers")
+        local singers = parse_characters(singers_json)
+        local synth_speaker = select_character_and_style(singers, "シンガー")
+        if not synth_speaker then return end
+
         local json_body = build_notes_json(notes, lyrics, bpm, ppq_per_qn)
         log("送信JSON: " .. json_body)
 
         log("歌唱クエリ生成中...")
-        if not call_voicevox_query(json_body) then
+        -- sing_frame_audio_query: 波音リツ(6000)固定
+        if not call_voicevox_query(json_body, CONFIG.QUERY_SPEAKER) then
             log("エラー: 歌唱クエリ生成に失敗しました")
             return
         end
 
         log("WAV生成中...")
-        call_voicevox_synthesis(FILES.output)
+        call_voicevox_synthesis(FILES.output, synth_speaker)
     else
         -- トークモード
         log("トークモード: " .. item_name)
-        if not call_voicevox_talk(item_name, FILES.output) then
+
+        -- スピーカー選択
+        log("スピーカー一覧を取得中...")
+        local speakers_json = fetch_voicevox_list("speakers")
+        local speakers = parse_characters(speakers_json)
+        local talk_speaker = select_character_and_style(speakers, "スピーカー")
+        if not talk_speaker then return end
+
+        if not call_voicevox_talk(item_name, FILES.output, talk_speaker) then
             log("エラー: トーク生成に失敗しました")
             return
         end
