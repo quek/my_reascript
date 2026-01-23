@@ -1,19 +1,22 @@
 --[[
-  VOICEVOX 歌唱合成スクリプト for REAPER
-  MIDIノートと歌詞から歌声を生成し、トラックに挿入する
+  VOICEVOX 歌唱/トーク合成スクリプト for REAPER
+  - 歌唱モード: MIDIノート + 歌詞 → 歌声生成
+  - トークモード: テキスト → 音声生成
 ]]
 
+--------------------------------------------------------------------------------
 -- 設定
+--------------------------------------------------------------------------------
+
 local CONFIG = {
     VOICEVOX_URL = "http://localhost:50021",
-    QUERY_SPEAKER = 6000,   -- 波音リツ（歌唱クエリ生成用・固定）
-    FRAME_RATE = 93.75,     -- 24000Hz / 256サンプル
+    QUERY_SPEAKER = 6000,       -- 波音リツ（歌唱クエリ生成用・固定）
+    FRAME_RATE = 93.75,         -- 24000Hz / 256サンプル
     OUTPUT_SAMPLE_RATE = 48000,
     TEMP_DIR = "C:\\tmp\\",
-    REST_FRAMES = 10,       -- 前後の休符フレーム数
+    REST_FRAMES = 10,           -- 前後の休符フレーム数
 }
 
--- ファイルパス
 local FILES = {
     query = CONFIG.TEMP_DIR .. "sing_query.json",
     response = CONFIG.TEMP_DIR .. "sing_response.json",
@@ -23,8 +26,11 @@ local FILES = {
     last_speaker = CONFIG.TEMP_DIR .. "voicevox_last_speaker.txt",
 }
 
+-- 外部から設定可能なフラグ（voicevox_select.lua用）
+VOICEVOX_FORCE_SELECT = VOICEVOX_FORCE_SELECT or false
+
 --------------------------------------------------------------------------------
--- ユーティリティ関数
+-- ユーティリティ
 --------------------------------------------------------------------------------
 
 local log_buffer = {}
@@ -60,10 +66,10 @@ local function url_encode(str)
 end
 
 --------------------------------------------------------------------------------
--- キャラクター選択UI
+-- キャラクター選択
 --------------------------------------------------------------------------------
 
-local function fetch_voicevox_list(endpoint)
+local function fetch_character_list(endpoint)
     local cmd = string.format(
         'curl.exe -s "%s/%s" -o "%s"',
         CONFIG.VOICEVOX_URL, endpoint, FILES.list
@@ -76,29 +82,24 @@ local function parse_characters(json)
     if not json then return {} end
 
     local characters = {}
-    -- キャラクター単位でパース（"styles":[ で区切る）
     local pos = 1
+
     while true do
-        -- 次のキャラクターブロックを探す
         local name_start = json:find('"name":', pos)
         if not name_start then break end
 
-        -- キャラクター名を取得
         local char_name = json:match('"name":"([^"]+)"', name_start)
         if not char_name then break end
 
-        -- stylesを探す
         local styles_start = json:find('"styles":%s*%[', name_start)
         if not styles_start then break end
 
-        -- stylesの終わりを探す
         local styles_end = json:find('%]', styles_start)
         if not styles_end then break end
 
         local styles_json = json:sub(styles_start, styles_end)
-
-        -- スタイルをパース
         local styles = {}
+
         for style_block in styles_json:gmatch('%{[^%}]+%}') do
             local style_name = style_block:match('"name":"([^"]+)"')
             local style_id = style_block:match('"id":(%d+)')
@@ -117,13 +118,6 @@ local function parse_characters(json)
     return characters
 end
 
-local function show_menu(items)
-    gfx.init("", 0, 0)
-    local choice = gfx.showmenu(table.concat(items, "|"))
-    gfx.quit()
-    return choice
-end
-
 local function find_character_by_id(characters, id)
     for _, char in ipairs(characters) do
         for _, style in ipairs(char.styles) do
@@ -135,38 +129,33 @@ local function find_character_by_id(characters, id)
     return nil, nil
 end
 
-local function load_last_selection(file_path)
-    local content = read_file(file_path)
-    if content then
-        return tonumber(content)
-    end
-    return nil
+local function show_menu(items)
+    gfx.init("", 0, 0)
+    local choice = gfx.showmenu(table.concat(items, "|"))
+    gfx.quit()
+    return choice
 end
 
-local function save_last_selection(file_path, id)
-    write_file(file_path, tostring(id))
-end
-
-local function select_character_and_style(characters, title, last_file, force_select)
+local function select_character(characters, title, last_file, force_select)
     if #characters == 0 then
         log("エラー: キャラクターが見つかりません")
         return nil, nil, nil
     end
 
-    -- 前回選択を確認（強制選択でない場合）
+    -- 前回選択を使用（強制選択でない場合）
     if not force_select then
-        local last_id = load_last_selection(last_file)
+        local content = read_file(last_file)
+        local last_id = content and tonumber(content)
         if last_id then
-            local last_char_name, last_style_name = find_character_by_id(characters, last_id)
-            if last_char_name then
-                log(string.format("%s: %s - %s (ID: %d)", title, last_char_name, last_style_name, last_id))
-                return last_id, last_char_name, last_style_name
+            local char_name, style_name = find_character_by_id(characters, last_id)
+            if char_name then
+                log(string.format("%s: %s - %s (ID: %d)", title, char_name, style_name, last_id))
+                return last_id, char_name, style_name
             end
         end
     end
 
-    -- キャラクター選択メニュー
-    -- 1. キャラクター選択
+    -- キャラクター選択
     local char_names = {}
     for _, c in ipairs(characters) do
         table.insert(char_names, c.name)
@@ -182,12 +171,10 @@ local function select_character_and_style(characters, title, last_file, force_se
     local char = characters[char_choice]
     log("選択: " .. char.name)
 
-    -- 2. スタイル選択（複数ある場合）
-    local selected_id, selected_style_name
+    -- スタイル選択（複数ある場合のみ）
+    local style
     if #char.styles == 1 then
-        selected_id = char.styles[1].id
-        selected_style_name = char.styles[1].name
-        log("スタイル: " .. selected_style_name .. " (ID: " .. selected_id .. ")")
+        style = char.styles[1]
     else
         local style_names = {}
         for _, s in ipairs(char.styles) do
@@ -200,15 +187,15 @@ local function select_character_and_style(characters, title, last_file, force_se
             log("キャンセルされました")
             return nil, nil, nil
         end
-
-        selected_id = char.styles[style_choice].id
-        selected_style_name = char.styles[style_choice].name
-        log("スタイル: " .. selected_style_name .. " (ID: " .. selected_id .. ")")
+        style = char.styles[style_choice]
     end
 
+    log(string.format("スタイル: %s (ID: %d)", style.name, style.id))
+
     -- 選択を保存
-    save_last_selection(last_file, selected_id)
-    return selected_id, char.name, selected_style_name
+    write_file(last_file, tostring(style.id))
+
+    return style.id, char.name, style.name
 end
 
 --------------------------------------------------------------------------------
@@ -219,8 +206,7 @@ local function get_project_info(take)
     local bpm = reaper.Master_GetTempo()
     local ppq_at_0 = reaper.MIDI_GetPPQPosFromProjQN(take, 0)
     local ppq_at_1 = reaper.MIDI_GetPPQPosFromProjQN(take, 1)
-    local ppq_per_qn = ppq_at_1 - ppq_at_0
-    return bpm, ppq_per_qn
+    return bpm, ppq_at_1 - ppq_at_0
 end
 
 local function get_midi_notes(take)
@@ -246,6 +232,7 @@ end
 local function split_lyrics(text)
     local small_kana = "ぁぃぅぇぉゃゅょっァィゥェォャュョッ"
     local lyrics = {}
+
     for char in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
         if #lyrics > 0 and small_kana:find(char, 1, true) then
             lyrics[#lyrics] = lyrics[#lyrics] .. char
@@ -253,11 +240,12 @@ local function split_lyrics(text)
             table.insert(lyrics, char)
         end
     end
+
     return lyrics
 end
 
 --------------------------------------------------------------------------------
--- フレーム計算
+-- フレーム・時間変換
 --------------------------------------------------------------------------------
 
 local function ppq_to_frames(ppq, bpm, ppq_per_qn)
@@ -273,11 +261,11 @@ end
 -- JSON生成
 --------------------------------------------------------------------------------
 
-local function build_notes_json(notes, lyrics, bpm, ppq_per_qn)
-    local json_parts = {}
+local function build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
+    local parts = {}
 
     -- 開始休符
-    table.insert(json_parts, string.format(
+    table.insert(parts, string.format(
         '{"id":"rest_start","key":null,"frame_length":%d,"lyric":""}',
         CONFIG.REST_FRAMES
     ))
@@ -287,7 +275,7 @@ local function build_notes_json(notes, lyrics, bpm, ppq_per_qn)
         if i > 1 then
             local gap = note.startppq - notes[i - 1].endppq
             if gap > 0 then
-                table.insert(json_parts, string.format(
+                table.insert(parts, string.format(
                     '{"id":"rest%d","key":null,"frame_length":%d,"lyric":""}',
                     i, ppq_to_frames(gap, bpm, ppq_per_qn)
                 ))
@@ -295,99 +283,84 @@ local function build_notes_json(notes, lyrics, bpm, ppq_per_qn)
         end
 
         -- ノート
-        table.insert(json_parts, string.format(
+        table.insert(parts, string.format(
             '{"id":"note%d","key":%d,"frame_length":%d,"lyric":"%s"}',
-            i,
-            note.pitch,
-            ppq_to_frames(note.length, bpm, ppq_per_qn),
-            lyrics[i] or "ん"
+            i, note.pitch, ppq_to_frames(note.length, bpm, ppq_per_qn), lyrics[i] or "ん"
         ))
     end
 
     -- 終了休符
-    table.insert(json_parts, string.format(
+    table.insert(parts, string.format(
         '{"id":"rest_end","key":null,"frame_length":%d,"lyric":""}',
         CONFIG.REST_FRAMES
     ))
 
-    return '{"notes":[' .. table.concat(json_parts, ",") .. ']}'
+    return '{"notes":[' .. table.concat(parts, ",") .. ']}'
 end
 
 --------------------------------------------------------------------------------
 -- VOICEVOX API
 --------------------------------------------------------------------------------
 
-local function call_voicevox_query(json_body, query_speaker)
+local function modify_sample_rate(content)
+    return content:gsub(
+        '"outputSamplingRate":%s*%d+',
+        '"outputSamplingRate":' .. CONFIG.OUTPUT_SAMPLE_RATE
+    )
+end
+
+local function exec_curl(cmd, timeout)
+    reaper.ExecProcess(cmd, timeout)
+end
+
+local function voicevox_sing_query(json_body)
     write_file(FILES.query, json_body)
 
     local cmd = string.format(
         'curl.exe -s -X POST "%s/sing_frame_audio_query?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
-        CONFIG.VOICEVOX_URL,
-        query_speaker,
-        FILES.query,
-        FILES.response
+        CONFIG.VOICEVOX_URL, CONFIG.QUERY_SPEAKER, FILES.query, FILES.response
     )
-    reaper.ExecProcess(cmd, 30000)
-
-    local content = read_file(FILES.response)
-    if not content or content:find('"detail"') then
-        return nil
-    end
-
-    -- サンプリングレート変更
-    content = content:gsub(
-        '"outputSamplingRate":%s*%d+',
-        '"outputSamplingRate":' .. CONFIG.OUTPUT_SAMPLE_RATE
-    )
-    write_file(FILES.modified, content)
-
-    return true
-end
-
-local function call_voicevox_synthesis(output_path, synth_speaker)
-    local cmd = string.format(
-        'curl.exe -s -X POST "%s/frame_synthesis?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
-        CONFIG.VOICEVOX_URL,
-        synth_speaker,
-        FILES.modified,
-        output_path
-    )
-    reaper.ExecProcess(cmd, 60000)
-    return true
-end
-
-local function call_voicevox_talk(text, output_path, talk_speaker)
-    -- audio_query
-    local cmd = string.format(
-        'curl.exe -s -X POST "%s/audio_query?speaker=%d&text=%s" -o "%s"',
-        CONFIG.VOICEVOX_URL,
-        talk_speaker,
-        url_encode(text),
-        FILES.response
-    )
-    reaper.ExecProcess(cmd, 30000)
+    exec_curl(cmd, 30000)
 
     local content = read_file(FILES.response)
     if not content or content:find('"detail"') then
         return false
     end
 
-    -- サンプリングレート変更
-    content = content:gsub(
-        '"outputSamplingRate":%s*%d+',
-        '"outputSamplingRate":' .. CONFIG.OUTPUT_SAMPLE_RATE
+    write_file(FILES.modified, modify_sample_rate(content))
+    return true
+end
+
+local function voicevox_sing_synthesis(output_path, speaker_id)
+    local cmd = string.format(
+        'curl.exe -s -X POST "%s/frame_synthesis?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
+        CONFIG.VOICEVOX_URL, speaker_id, FILES.modified, output_path
     )
-    write_file(FILES.modified, content)
+    exec_curl(cmd, 60000)
+    return true
+end
+
+local function voicevox_talk(text, output_path, speaker_id)
+    -- audio_query
+    local cmd = string.format(
+        'curl.exe -s -X POST "%s/audio_query?speaker=%d&text=%s" -o "%s"',
+        CONFIG.VOICEVOX_URL, speaker_id, url_encode(text), FILES.response
+    )
+    exec_curl(cmd, 30000)
+
+    local content = read_file(FILES.response)
+    if not content or content:find('"detail"') then
+        return false
+    end
+
+    write_file(FILES.modified, modify_sample_rate(content))
 
     -- synthesis
     cmd = string.format(
         'curl.exe -s -X POST "%s/synthesis?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
-        CONFIG.VOICEVOX_URL,
-        talk_speaker,
-        FILES.modified,
-        output_path
+        CONFIG.VOICEVOX_URL, speaker_id, FILES.modified, output_path
     )
-    reaper.ExecProcess(cmd, 60000)
+    exec_curl(cmd, 60000)
     return true
 end
 
@@ -397,53 +370,121 @@ end
 
 local function get_target_track(source_track)
     local track_idx = reaper.GetMediaTrackInfo_Value(source_track, "IP_TRACKNUMBER")
-    local target_track = reaper.GetTrack(0, track_idx)
+    local target = reaper.GetTrack(0, track_idx)
 
-    if not target_track then
+    if not target then
         reaper.InsertTrackAtIndex(track_idx, true)
-        target_track = reaper.GetTrack(0, track_idx)
+        target = reaper.GetTrack(0, track_idx)
     end
 
-    return target_track
+    return target
 end
 
-local function delete_item_at_position(track, start_pos)
-    local tolerance = 0.001  -- 1ms許容
+local function get_selected_items()
+    local items = {}
+    for i = 0, reaper.CountSelectedMediaItems(0) - 1 do
+        table.insert(items, reaper.GetSelectedMediaItem(0, i))
+    end
+    return items
+end
+
+local function delete_item_at_position(track, position)
+    local tolerance = 0.001
     for i = reaper.CountTrackMediaItems(track) - 1, 0, -1 do
         local item = reaper.GetTrackMediaItem(track, i)
-        local item_start = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
-        if math.abs(item_start - start_pos) < tolerance then
+        local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        if math.abs(item_pos - position) < tolerance then
             reaper.DeleteTrackMediaItem(track, item)
         end
     end
 end
 
-local function insert_wav(wav_path, position, track, use_offset, selected_items)
-    local orig_pos = reaper.GetCursorPosition()
-    local start_pos = position
-    if use_offset then
-        start_pos = position - frames_to_seconds(CONFIG.REST_FRAMES)
-    end
-    delete_item_at_position(track, start_pos)
-    reaper.SetEditCurPos(start_pos, false, false)
+local function insert_wav(wav_path, position, track, apply_offset, restore_items)
+    local orig_cursor = reaper.GetCursorPosition()
+    local insert_pos = apply_offset and position - frames_to_seconds(CONFIG.REST_FRAMES) or position
+
+    delete_item_at_position(track, insert_pos)
+    reaper.SetEditCurPos(insert_pos, false, false)
     reaper.SetOnlyTrackSelected(track)
     reaper.InsertMedia(wav_path, 0)
+
+    -- 選択状態を復元
     reaper.SelectAllMediaItems(0, false)
-    for _, item in ipairs(selected_items) do
+    for _, item in ipairs(restore_items) do
         reaper.SetMediaItemSelected(item, true)
     end
-    reaper.SetEditCurPos(orig_pos, false, false)
+    reaper.SetEditCurPos(orig_cursor, false, false)
+end
+
+--------------------------------------------------------------------------------
+-- 歌唱モード処理
+--------------------------------------------------------------------------------
+
+local function process_sing_mode(take, item_name, bpm, ppq_per_qn, notes)
+    local lyrics = split_lyrics(item_name)
+    log(string.format("ノート数: %d, 歌詞: %s", #notes, table.concat(lyrics, "")))
+
+    -- シンガー選択
+    log("シンガー一覧を取得中...")
+    local json = fetch_character_list("singers")
+    local singers = parse_characters(json)
+    local speaker_id, char_name, style_name = select_character(
+        singers, "シンガー", FILES.last_singer, VOICEVOX_FORCE_SELECT
+    )
+    if not speaker_id then return nil end
+
+    local output_path = string.format("%svoicevox_%s_%s.wav", CONFIG.TEMP_DIR, char_name, style_name)
+
+    -- クエリ生成
+    local query_json = build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
+    log("送信JSON: " .. query_json)
+
+    log("歌唱クエリ生成中...")
+    if not voicevox_sing_query(query_json) then
+        log("エラー: 歌唱クエリ生成に失敗しました")
+        return false
+    end
+
+    -- 合成
+    log("WAV生成中...")
+    voicevox_sing_synthesis(output_path, speaker_id)
+
+    return output_path
+end
+
+--------------------------------------------------------------------------------
+-- トークモード処理
+--------------------------------------------------------------------------------
+
+local function process_talk_mode(item_name)
+    log("トークモード: " .. item_name)
+
+    -- スピーカー選択
+    log("スピーカー一覧を取得中...")
+    local json = fetch_character_list("speakers")
+    local speakers = parse_characters(json)
+    local speaker_id, char_name, style_name = select_character(
+        speakers, "スピーカー", FILES.last_speaker, VOICEVOX_FORCE_SELECT
+    )
+    if not speaker_id then return nil end
+
+    local output_path = string.format("%svoicevox_%s_%s.wav", CONFIG.TEMP_DIR, char_name, style_name)
+
+    -- 合成
+    if not voicevox_talk(item_name, output_path, speaker_id) then
+        log("エラー: トーク生成に失敗しました")
+        return false
+    end
+
+    return output_path
 end
 
 --------------------------------------------------------------------------------
 -- メイン処理
 --------------------------------------------------------------------------------
 
--- 外部から設定可能なフラグ
-VOICEVOX_FORCE_SELECT = VOICEVOX_FORCE_SELECT or false
-
 local function main()
-    log("=== VOICEVOX歌唱合成 ===")
+    log("=== VOICEVOX合成 ===")
 
     -- MIDIアイテム取得
     local item = reaper.GetSelectedMediaItem(0, 0)
@@ -458,92 +499,49 @@ local function main()
         return false
     end
 
-    -- アイテム名から歌詞取得
     local _, item_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
     if item_name == "" then
-        log("エラー: アイテム名（歌詞）が空です")
+        log("エラー: アイテム名（歌詞/テキスト）が空です")
         return false
     end
 
-    -- プロジェクト情報取得
+    -- モード判定と処理
     local bpm, ppq_per_qn = get_project_info(take)
-    log(string.format("BPM: %.1f, PPQ/QN: %.0f", bpm, ppq_per_qn))
-
-    -- MIDIノート取得
     local notes = get_midi_notes(take)
     local is_sing = #notes > 0
 
+    log(string.format("BPM: %.1f, モード: %s", bpm, is_sing and "歌唱" or "トーク"))
+
     local output_path
     if is_sing then
-        -- 歌唱モード
-        local lyrics = split_lyrics(item_name)
-        log(string.format("ノート数: %d, 歌詞: %s", #notes, table.concat(lyrics, "")))
-
-        -- シンガー選択
-        log("シンガー一覧を取得中...")
-        local singers_json = fetch_voicevox_list("singers")
-        local singers = parse_characters(singers_json)
-        local synth_speaker, singer_name, style_name = select_character_and_style(singers, "シンガー", FILES.last_singer, VOICEVOX_FORCE_SELECT)
-        if not synth_speaker then return end  -- キャンセル時はログ非表示
-
-        output_path = string.format("%svoicevox_%s_%s.wav", CONFIG.TEMP_DIR, singer_name, style_name)
-
-        local json_body = build_notes_json(notes, lyrics, bpm, ppq_per_qn)
-        log("送信JSON: " .. json_body)
-
-        log("歌唱クエリ生成中...")
-        -- sing_frame_audio_query: 波音リツ(6000)固定
-        if not call_voicevox_query(json_body, CONFIG.QUERY_SPEAKER) then
-            log("エラー: 歌唱クエリ生成に失敗しました")
-            return false
-        end
-
-        log("WAV生成中...")
-        call_voicevox_synthesis(output_path, synth_speaker)
+        output_path = process_sing_mode(take, item_name, bpm, ppq_per_qn, notes)
     else
-        -- トークモード
-        log("トークモード: " .. item_name)
-
-        -- スピーカー選択
-        log("スピーカー一覧を取得中...")
-        local speakers_json = fetch_voicevox_list("speakers")
-        local speakers = parse_characters(speakers_json)
-        local talk_speaker, speaker_name, style_name = select_character_and_style(speakers, "スピーカー", FILES.last_speaker, VOICEVOX_FORCE_SELECT)
-        if not talk_speaker then return end  -- キャンセル時はログ非表示
-
-        output_path = string.format("%svoicevox_%s_%s.wav", CONFIG.TEMP_DIR, speaker_name, style_name)
-
-        if not call_voicevox_talk(item_name, output_path, talk_speaker) then
-            log("エラー: トーク生成に失敗しました")
-            return false
-        end
+        output_path = process_talk_mode(item_name)
     end
+
+    -- キャンセルまたはエラー
+    if output_path == nil then return end
+    if output_path == false then return false end
 
     -- REAPERに挿入
     log("REAPERに挿入...")
     local item_start = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
     local item_track = reaper.GetMediaItem_Track(item)
     local target_track = get_target_track(item_track)
+    local selected_items = get_selected_items()
 
-    -- 選択中のアイテムを保存
-    local selected_items = {}
-    for i = 0, reaper.CountSelectedMediaItems(0) - 1 do
-        table.insert(selected_items, reaper.GetSelectedMediaItem(0, i))
-    end
-
-    -- 歌唱モードの場合、最初のノートの位置を基準にする
-    local insert_position = item_start
+    local insert_pos = item_start
     if is_sing and #notes > 0 then
-        insert_position = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
+        insert_pos = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
     end
 
-    insert_wav(output_path, insert_position, target_track, is_sing, selected_items)
+    insert_wav(output_path, insert_pos, target_track, is_sing, selected_items)
 
     log("完了！")
     return true
 end
 
--- エラー時のみログ表示
+-- 実行（エラー時のみログ表示）
 if main() == false then
     show_log()
 end
