@@ -302,7 +302,7 @@ local function build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
         -- ノート
         table.insert(parts, string.format(
             '{"id":"note%d","key":%d,"frame_length":%d,"lyric":"%s"}',
-            i, note.pitch, note_frames, lyrics[i] or "ん"
+            i, note.pitch, note_frames, lyrics[i] or "ら"
         ))
 
         prev_frame = note_end_frame
@@ -452,7 +452,7 @@ local function process_sing_mode(take, item_name, bpm, ppq_per_qn, notes)
     )
     if not speaker_id then return nil end
 
-    local output_path = string.format("%svoicevox_%s_%s.wav", CONFIG.TEMP_DIR, char_name, style_name)
+    local output_path = string.format("%s%s_%s.wav", CONFIG.TEMP_DIR, char_name, style_name)
 
     -- クエリ生成
     local query_json = build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
