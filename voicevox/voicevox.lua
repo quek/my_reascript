@@ -234,7 +234,10 @@ local function split_lyrics(text)
     local lyrics = {}
 
     for char in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-        if #lyrics > 0 and small_kana:find(char, 1, true) then
+        -- スペースを無視（半角・全角）
+        if char == " " or char == "　" then
+            -- skip
+        elseif #lyrics > 0 and small_kana:find(char, 1, true) then
             lyrics[#lyrics] = lyrics[#lyrics] .. char
         else
             table.insert(lyrics, char)
