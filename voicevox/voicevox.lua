@@ -428,7 +428,15 @@ local function insert_wav(wav_path, position, track, apply_offset, restore_items
     delete_item_at_position(track, insert_pos)
     reaper.SetEditCurPos(insert_pos, false, false)
     reaper.SetOnlyTrackSelected(track)
+
+    -- ピークダイアログを一時的に無効化
+    local orig_showpeaks = reaper.SNM_GetIntConfigVar("showpeaksbuild", 1)
+    reaper.SNM_SetIntConfigVar("showpeaksbuild", 0)
+
     reaper.InsertMedia(wav_path, 0)
+
+    -- 設定を復元
+    reaper.SNM_SetIntConfigVar("showpeaksbuild", orig_showpeaks)
 
     -- 選択状態を復元
     reaper.SelectAllMediaItems(0, false)
