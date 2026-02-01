@@ -10,6 +10,7 @@
 
 local CONFIG = {
     VOICEVOX_URL = "http://localhost:50021",
+    VOICEVOX_EXE = "C:\\Program Files\\VOICEVOX\\VOICEVOX.exe",
     QUERY_SPEAKER = 6000,       -- 波音リツ（歌唱クエリ生成用・固定）
     FRAME_RATE = 93.75,         -- 24000Hz / 256サンプル
     OUTPUT_SAMPLE_RATE = 48000,
@@ -321,6 +322,42 @@ local function build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
 end
 
 --------------------------------------------------------------------------------
+-- VOICEVOX 起動確認
+--------------------------------------------------------------------------------
+
+local function is_voicevox_running()
+    local cmd = string.format(
+        'curl.exe -s --max-time 2 "%s/version" -o "%svoicevox_check.txt"',
+        CONFIG.VOICEVOX_URL, CONFIG.TEMP_DIR
+    )
+    reaper.ExecProcess(cmd, 5000)
+    local content = read_file(CONFIG.TEMP_DIR .. "voicevox_check.txt")
+    return content and content:match('^"[%d%.]+') ~= nil
+end
+
+local function ensure_voicevox_running()
+    if is_voicevox_running() then
+        return true
+    end
+
+    log("VOICEVOXを起動中...")
+    os.execute('start "" "' .. CONFIG.VOICEVOX_EXE .. '"')
+
+    -- 起動待ち（最大30秒）
+    for i = 1, 30 do
+        reaper.defer(function() end)  -- UIをブロックしない
+        os.execute("ping -n 2 127.0.0.1 > nul")  -- 約1秒待機
+        if is_voicevox_running() then
+            log("VOICEVOX起動完了")
+            return true
+        end
+    end
+
+    log("エラー: VOICEVOXの起動に失敗しました")
+    return false
+end
+
+--------------------------------------------------------------------------------
 -- VOICEVOX API
 --------------------------------------------------------------------------------
 
@@ -515,6 +552,11 @@ end
 
 local function main()
     log("=== VOICEVOX合成 ===")
+
+    -- VOICEVOX起動確認
+    if not ensure_voicevox_running() then
+        return false
+    end
 
     -- MIDIアイテム取得
     local item = reaper.GetSelectedMediaItem(0, 0)
