@@ -20,8 +20,6 @@ local frames_to_seconds = common.frames_to_seconds
 -- 口パク固有設定
 --------------------------------------------------------------------------------
 
-local MOUTH_DIR = "C:\\Users\\ancient\\Pictures\\素材\\中国うさぎ立ち絵素材2.0\\中国うさぎ立ち絵素材2.0\\!口\\"
-
 -- phoneme → 口画像ファイル名のマッピング
 local MOUTH_MAP = {
     -- 母音
@@ -29,7 +27,7 @@ local MOUTH_MAP = {
     i = "_えあー.png",    -- 横に開く
     u = "_お.png",        -- 唇をすぼめる
     e = "_にへ.png",
-    o = "_お.png",
+    o = "_あは.png",
     -- 特殊
     N = "_ん.png",        -- ん
     cl = "_ほほえみ.png", -- 促音（閉じた口）
@@ -161,13 +159,10 @@ end
 
 local function get_mouth_image(phoneme)
     local filename = MOUTH_MAP[phoneme] or MOUTH_MAP.default
-    return MOUTH_DIR .. filename
+    return CONFIG.MOUTH_DIR .. filename
 end
 
-local function fill_gaps_with_default(track, start_time, end_time)
-    local default_image = MOUTH_DIR .. MOUTH_MAP.default
-
-    -- 範囲内でend_timeを超えるアイテムを短縮
+local function trim_items_at_boundary(track, start_time, end_time)
     for i = reaper.CountTrackMediaItems(track) - 1, 0, -1 do
         local item = reaper.GetTrackMediaItem(track, i)
         local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
@@ -178,6 +173,12 @@ local function fill_gaps_with_default(track, start_time, end_time)
             reaper.SetMediaItemInfo_Value(item, "D_LENGTH", end_time - item_pos)
         end
     end
+end
+
+local function fill_gaps_with_default(track, start_time, end_time)
+    local default_image = CONFIG.MOUTH_DIR .. MOUTH_MAP.default
+
+    trim_items_at_boundary(track, start_time, end_time)
 
     -- トラック上のアイテムを時間順に取得
     local items = {}
@@ -209,17 +210,7 @@ local function fill_gaps_with_default(track, start_time, end_time)
         insert_mouth_image(default_image, current_pos, gap_duration, track)
     end
 
-    -- 最終確認: 範囲内でend_timeを超えるアイテムを短縮
-    for i = reaper.CountTrackMediaItems(track) - 1, 0, -1 do
-        local item = reaper.GetTrackMediaItem(track, i)
-        local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
-        local item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
-        local item_end = item_pos + item_len
-
-        if item_pos >= start_time and item_pos < end_time and item_end > end_time then
-            reaper.SetMediaItemInfo_Value(item, "D_LENGTH", end_time - item_pos)
-        end
-    end
+    trim_items_at_boundary(track, start_time, end_time)
 end
 
 --------------------------------------------------------------------------------
@@ -280,12 +271,6 @@ local function main()
     local first_note_time = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
     local phoneme_start_time = first_note_time - frames_to_seconds(CONFIG.REST_FRAMES)
 
-    -- phonemesの合計時間
-    local total_frames = 0
-    for _, p in ipairs(phonemes) do
-        total_frames = total_frames + p.frame_length
-    end
-
     -- 口パクトラック取得
     local video_track = get_or_create_mouth_track()
 
@@ -306,13 +291,19 @@ local function main()
     for i, p in ipairs(phonemes) do
         local duration = frames_to_seconds(p.frame_length)
 
-        -- MIDIアイテムの終端を超えないようにする
+        -- MIDIアイテムの範囲外はスキップ
+        if current_time + duration <= item_start then
+            current_time = current_time + duration
+            goto continue
+        end
         if current_time >= item_end then
             break
         end
-        if current_time + duration > item_end then
-            duration = item_end - current_time
-        end
+
+        -- 範囲にクランプ
+        local actual_start = math.max(current_time, item_start)
+        local actual_end = math.min(current_time + duration, item_end)
+        duration = actual_end - actual_start
 
         -- 子音の場合は次の母音の口形状を使う
         local effective_phoneme = p.phoneme
@@ -335,11 +326,12 @@ local function main()
             local prev_duration = reaper.GetMediaItemInfo_Value(prev_item, "D_LENGTH")
             reaper.SetMediaItemInfo_Value(prev_item, "D_LENGTH", prev_duration + duration)
         else
-            prev_item = insert_mouth_image(mouth_file, current_time, duration, video_track)
+            prev_item = insert_mouth_image(mouth_file, actual_start, duration, video_track)
         end
 
         prev_phoneme = effective_phoneme
-        current_time = current_time + duration
+        current_time = current_time + frames_to_seconds(p.frame_length)
+        ::continue::
     end
 
     -- ギャップをデフォルト画像で埋める（MIDIアイテム全体の範囲）
