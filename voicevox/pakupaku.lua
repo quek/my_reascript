@@ -25,9 +25,9 @@ local CONFIG = {
 local MOUTH_MAP = {
     -- 母音
     a = "_おあー.png",
-    i = "_へひひ.png",      -- 横に開く
+    i = "_えあー.png",    -- 横に開く
     u = "_お.png",        -- 唇をすぼめる
-    e = "_えあー.png",
+    e = "_にへ.png",
     o = "_お.png",
     -- 特殊
     N = "_ん.png",        -- ん
@@ -344,27 +344,19 @@ local function delete_items_in_range(track, start_time, end_time)
 end
 
 local function insert_mouth_image(image_path, position, duration, track)
-    local orig_cursor = reaper.GetCursorPosition()
+    -- アイテムを直接作成（InsertMediaを使わない）
+    local item = reaper.AddMediaItemToTrack(track)
+    reaper.SetMediaItemInfo_Value(item, "D_POSITION", position)
+    reaper.SetMediaItemInfo_Value(item, "D_LENGTH", duration)
 
-    reaper.SetEditCurPos(position, false, false)
-    reaper.SetOnlyTrackSelected(track)
+    -- テイクを追加してソースを設定
+    local take = reaper.AddTakeToMediaItem(item)
+    local source = reaper.PCM_Source_CreateFromFile(image_path)
+    reaper.SetMediaItemTake_Source(take, source)
 
-    -- ピークダイアログを一時的に無効化
-    local orig_showpeaks = reaper.SNM_GetIntConfigVar("showpeaksbuild", 1)
-    reaper.SNM_SetIntConfigVar("showpeaksbuild", 0)
-
-    reaper.InsertMedia(image_path, 0)
-
-    -- 設定を復元
-    reaper.SNM_SetIntConfigVar("showpeaksbuild", orig_showpeaks)
-
-    -- 挿入されたアイテムの長さを調整
-    local item = reaper.GetTrackMediaItem(track, reaper.CountTrackMediaItems(track) - 1)
-    if item then
-        reaper.SetMediaItemInfo_Value(item, "D_LENGTH", duration)
-    end
-
-    reaper.SetEditCurPos(orig_cursor, false, false)
+    -- テイク名を設定
+    local filename = image_path:match("([^\\]+)$")
+    reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", filename, true)
 
     return item
 end
@@ -372,6 +364,74 @@ end
 local function get_mouth_image(phoneme)
     local filename = MOUTH_MAP[phoneme] or MOUTH_MAP.default
     return CONFIG.MOUTH_DIR .. filename
+end
+
+local function fill_gaps_with_default(track, start_time, end_time)
+    local default_image = CONFIG.MOUTH_DIR .. MOUTH_MAP.default
+
+    -- 範囲内でend_timeを超えるアイテムを短縮
+    for i = reaper.CountTrackMediaItems(track) - 1, 0, -1 do
+        local item = reaper.GetTrackMediaItem(track, i)
+        local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        local item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+        local item_item_end = item_pos + item_len
+
+        -- start_time〜end_timeの範囲内で開始するアイテムのみ処理
+        if item_pos >= start_time and item_pos < end_time then
+            if item_item_end > end_time then
+                -- アイテムがend_timeをまたいでいる場合は短縮
+                reaper.SetMediaItemInfo_Value(item, "D_LENGTH", end_time - item_pos)
+            end
+        end
+    end
+
+    -- トラック上のアイテムを時間順に取得
+    local items = {}
+    for i = 0, reaper.CountTrackMediaItems(track) - 1 do
+        local item = reaper.GetTrackMediaItem(track, i)
+        local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        local item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+        -- 範囲内のアイテムのみ
+        if item_pos < end_time and item_pos + item_len > start_time then
+            table.insert(items, { pos = item_pos, len = item_len, item_end = item_pos + item_len })
+        end
+    end
+
+    -- 時間順にソート
+    table.sort(items, function(a, b) return a.pos < b.pos end)
+
+    -- ギャップを検出してデフォルト画像で埋める
+    local current_pos = start_time
+
+    for _, item_info in ipairs(items) do
+        if item_info.pos > current_pos + 0.001 then  -- 小さな誤差を許容
+            -- ギャップがある
+            local gap_duration = item_info.pos - current_pos
+            insert_mouth_image(default_image, current_pos, gap_duration, track)
+        end
+        current_pos = math.max(current_pos, item_info.item_end)
+    end
+
+    -- 最後のアイテムの後にギャップがあれば埋める
+    if current_pos < end_time - 0.001 then
+        local gap_duration = end_time - current_pos
+        insert_mouth_image(default_image, current_pos, gap_duration, track)
+    end
+
+    -- 最終確認: 範囲内でend_timeを超えるアイテムを短縮
+    for i = reaper.CountTrackMediaItems(track) - 1, 0, -1 do
+        local item = reaper.GetTrackMediaItem(track, i)
+        local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        local item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+        local item_item_end = item_pos + item_len
+
+        -- start_time〜end_timeの範囲内で開始するアイテムのみ処理
+        if item_pos >= start_time and item_pos < end_time then
+            if item_item_end > end_time then
+                reaper.SetMediaItemInfo_Value(item, "D_LENGTH", end_time - item_pos)
+            end
+        end
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -437,17 +497,21 @@ local function main()
 
     log(string.format("phoneme数: %d", #phonemes))
 
-    -- 開始位置（最初のノートの位置）
-    local start_time = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
-    -- REST_FRAMESの分を引く
-    start_time = start_time - frames_to_seconds(CONFIG.REST_FRAMES)
+    -- MIDIアイテムの開始・終了位置
+    local item_start = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local item_length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+    local item_end = item_start + item_length
 
-    -- 終了位置を計算（phonemesの合計時間）
+    -- phonemesの配置開始位置（最初のノートの位置からREST_FRAMESを引く）
+    local first_note_time = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
+    local phoneme_start_time = first_note_time - frames_to_seconds(CONFIG.REST_FRAMES)
+
+    -- phonemesの合計時間
     local total_frames = 0
     for _, p in ipairs(phonemes) do
         total_frames = total_frames + p.frame_length
     end
-    local end_time = start_time + frames_to_seconds(total_frames)
+    local phoneme_end_time = phoneme_start_time + frames_to_seconds(total_frames)
 
     -- 口パクトラック取得
     local video_track = get_or_create_mouth_track()
@@ -458,16 +522,24 @@ local function main()
     -- Undo開始
     reaper.Undo_BeginBlock()
 
-    -- 既存の口パク画像を削除
-    delete_items_in_range(video_track, start_time, end_time)
+    -- 既存の口パク画像を削除（MIDIアイテム全体の範囲）
+    delete_items_in_range(video_track, item_start, item_end)
 
-    -- 口画像を配置
-    local current_time = start_time
+    -- 口画像を配置（phonemesの開始位置から）
+    local current_time = phoneme_start_time
     local prev_phoneme = nil
     local prev_item = nil
 
     for i, p in ipairs(phonemes) do
         local duration = frames_to_seconds(p.frame_length)
+
+        -- MIDIアイテムの終端を超えないようにする
+        if current_time >= item_end then
+            break
+        end
+        if current_time + duration > item_end then
+            duration = item_end - current_time
+        end
 
         -- 子音の場合は次の母音の口形状を使う
         local effective_phoneme = p.phoneme
@@ -499,6 +571,9 @@ local function main()
         prev_phoneme = effective_phoneme
         current_time = current_time + duration
     end
+
+    -- ギャップをデフォルト画像で埋める（MIDIアイテム全体の範囲）
+    fill_gaps_with_default(video_track, item_start, item_end)
 
     -- Undo終了
     reaper.Undo_EndBlock("口パク画像貼り付け", -1)
