@@ -4,19 +4,21 @@
   - トークモード: テキスト → 音声生成
 ]]
 
---------------------------------------------------------------------------------
--- 設定
---------------------------------------------------------------------------------
+-- 共通ライブラリ読み込み
+local script_dir = debug.getinfo(1, "S").source:match("@(.+[\\/])")
+local common = dofile(script_dir .. "common.lua")
 
-local CONFIG = {
-    VOICEVOX_URL = "http://localhost:50021",
-    VOICEVOX_EXE = "C:\\Program Files\\VOICEVOX\\VOICEVOX.exe",
-    QUERY_SPEAKER = 6000,       -- 波音リツ（歌唱クエリ生成用・固定）
-    FRAME_RATE = 93.75,         -- 24000Hz / 256サンプル
-    OUTPUT_SAMPLE_RATE = 48000,
-    TEMP_DIR = "C:\\tmp\\",
-    REST_FRAMES = 10,           -- 前後の休符フレーム数
-}
+local CONFIG = common.CONFIG
+local log = common.log
+local show_log = common.show_log
+local read_file = common.read_file
+local write_file = common.write_file
+local url_encode = common.url_encode
+local frames_to_seconds = common.frames_to_seconds
+
+--------------------------------------------------------------------------------
+-- ファイルパス
+--------------------------------------------------------------------------------
 
 local FILES = {
     query = CONFIG.TEMP_DIR .. "sing_query.json",
@@ -29,42 +31,6 @@ local FILES = {
 
 -- 外部から設定可能なフラグ（voicevox_select.lua用）
 VOICEVOX_FORCE_SELECT = VOICEVOX_FORCE_SELECT or false
-
---------------------------------------------------------------------------------
--- ユーティリティ
---------------------------------------------------------------------------------
-
-local log_buffer = {}
-
-local function log(msg)
-    table.insert(log_buffer, msg)
-end
-
-local function show_log()
-    reaper.ShowConsoleMsg(table.concat(log_buffer, "\n") .. "\n")
-end
-
-local function read_file(path)
-    local f = io.open(path, "r")
-    if not f then return nil end
-    local content = f:read("*a")
-    f:close()
-    return content
-end
-
-local function write_file(path, content)
-    local f = io.open(path, "w")
-    if not f then return false end
-    f:write(content)
-    f:close()
-    return true
-end
-
-local function url_encode(str)
-    return str:gsub("([^%w%-_%.~])", function(c)
-        return string.format("%%%02X", string.byte(c))
-    end)
-end
 
 --------------------------------------------------------------------------------
 -- キャラクター選択
@@ -200,164 +166,6 @@ local function select_character(characters, title, last_file, force_select)
 end
 
 --------------------------------------------------------------------------------
--- MIDI処理
---------------------------------------------------------------------------------
-
-local function get_project_info(take)
-    local bpm = reaper.Master_GetTempo()
-    local ppq_at_0 = reaper.MIDI_GetPPQPosFromProjQN(take, 0)
-    local ppq_at_1 = reaper.MIDI_GetPPQPosFromProjQN(take, 1)
-    return bpm, ppq_at_1 - ppq_at_0
-end
-
-local function get_midi_notes(take)
-    local _, note_count = reaper.MIDI_CountEvts(take)
-    local notes = {}
-
-    for i = 0, note_count - 1 do
-        local retval, _, _, startppq, endppq, _, pitch, _ = reaper.MIDI_GetNote(take, i)
-        if retval then
-            table.insert(notes, {
-                pitch = pitch,
-                startppq = startppq,
-                endppq = endppq,
-                length = endppq - startppq
-            })
-        end
-    end
-
-    table.sort(notes, function(a, b) return a.startppq < b.startppq end)
-    return notes
-end
-
-local function split_lyrics(text)
-    local small_kana = "ぁぃぅぇぉゃゅょっァィゥェォャュョッ"
-    local lyrics = {}
-
-    for char in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-        -- スペースを無視（半角・全角）
-        if char == " " or char == "　" then
-            -- skip
-        elseif #lyrics > 0 and small_kana:find(char, 1, true) then
-            lyrics[#lyrics] = lyrics[#lyrics] .. char
-        else
-            table.insert(lyrics, char)
-        end
-    end
-
-    return lyrics
-end
-
---------------------------------------------------------------------------------
--- フレーム・時間変換
---------------------------------------------------------------------------------
-
-local function ppq_to_seconds(ppq, bpm, ppq_per_qn)
-    return ppq / ppq_per_qn * (60 / bpm)
-end
-
-local function seconds_to_frames(seconds)
-    return math.max(math.floor(seconds * CONFIG.FRAME_RATE + 0.5), 1)
-end
-
-local function frames_to_seconds(frames)
-    return frames / CONFIG.FRAME_RATE
-end
-
---------------------------------------------------------------------------------
--- JSON生成
---------------------------------------------------------------------------------
-
-local function build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
-    local parts = {}
-
-    -- 開始休符
-    table.insert(parts, string.format(
-        '{"id":"rest_start","key":null,"frame_length":%d,"lyric":""}',
-        CONFIG.REST_FRAMES
-    ))
-
-    -- 最初のノートの開始位置を基準点とする
-    local base_ppq = notes[1].startppq
-    local prev_frame = 0  -- 基準点からの累積フレーム位置
-
-    for i, note in ipairs(notes) do
-        -- ノート開始位置のフレーム（基準点からの累積）
-        local note_start_sec = ppq_to_seconds(note.startppq - base_ppq, bpm, ppq_per_qn)
-        local note_start_frame = seconds_to_frames(note_start_sec)
-        if i == 1 then note_start_frame = 0 end  -- 最初のノートは基準点
-
-        -- ノート間の休符（累積フレームの差として計算）
-        if i > 1 then
-            local gap_frames = note_start_frame - prev_frame
-            if gap_frames > 0 then
-                table.insert(parts, string.format(
-                    '{"id":"rest%d","key":null,"frame_length":%d,"lyric":""}',
-                    i, gap_frames
-                ))
-            end
-        end
-
-        -- ノート終了位置のフレーム（基準点からの累積）
-        local note_end_sec = ppq_to_seconds(note.endppq - base_ppq, bpm, ppq_per_qn)
-        local note_end_frame = seconds_to_frames(note_end_sec)
-        local note_frames = math.max(note_end_frame - note_start_frame, 1)
-
-        -- ノート
-        table.insert(parts, string.format(
-            '{"id":"note%d","key":%d,"frame_length":%d,"lyric":"%s"}',
-            i, note.pitch, note_frames, lyrics[i] or "ら"
-        ))
-
-        prev_frame = note_end_frame
-    end
-
-    -- 終了休符
-    table.insert(parts, string.format(
-        '{"id":"rest_end","key":null,"frame_length":%d,"lyric":""}',
-        CONFIG.REST_FRAMES
-    ))
-
-    return '{"notes":[' .. table.concat(parts, ",") .. ']}'
-end
-
---------------------------------------------------------------------------------
--- VOICEVOX 起動確認
---------------------------------------------------------------------------------
-
-local function is_voicevox_running()
-    local cmd = string.format(
-        'curl.exe -s --max-time 2 "%s/version" -o "%svoicevox_check.txt"',
-        CONFIG.VOICEVOX_URL, CONFIG.TEMP_DIR
-    )
-    reaper.ExecProcess(cmd, 5000)
-    local content = read_file(CONFIG.TEMP_DIR .. "voicevox_check.txt")
-    return content and content:match('^"[%d%.]+') ~= nil
-end
-
-local function ensure_voicevox_running()
-    if is_voicevox_running() then
-        return true
-    end
-
-    log("VOICEVOXを起動中...")
-    os.execute('start "" "' .. CONFIG.VOICEVOX_EXE .. '"')
-
-    -- 起動待ち（最大30秒）
-    for i = 1, 30 do
-        reaper.defer(function() end)  -- UIをブロックしない
-        os.execute("ping -n 2 127.0.0.1 > nul")  -- 約1秒待機
-        if is_voicevox_running() then
-            log("VOICEVOX起動完了")
-            return true
-        end
-    end
-
-    log("エラー: VOICEVOXの起動に失敗しました")
-    return false
-end
-
---------------------------------------------------------------------------------
 -- VOICEVOX API
 --------------------------------------------------------------------------------
 
@@ -368,10 +176,6 @@ local function modify_sample_rate(content)
     )
 end
 
-local function exec_curl(cmd, timeout)
-    reaper.ExecProcess(cmd, timeout)
-end
-
 local function voicevox_sing_query(json_body)
     write_file(FILES.query, json_body)
 
@@ -379,7 +183,7 @@ local function voicevox_sing_query(json_body)
         'curl.exe -s -X POST "%s/sing_frame_audio_query?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
         CONFIG.VOICEVOX_URL, CONFIG.QUERY_SPEAKER, FILES.query, FILES.response
     )
-    exec_curl(cmd, 30000)
+    reaper.ExecProcess(cmd, 30000)
 
     local content = read_file(FILES.response)
     if not content or content:find('"detail"') then
@@ -395,7 +199,7 @@ local function voicevox_sing_synthesis(output_path, speaker_id)
         'curl.exe -s -X POST "%s/frame_synthesis?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
         CONFIG.VOICEVOX_URL, speaker_id, FILES.modified, output_path
     )
-    exec_curl(cmd, 60000)
+    reaper.ExecProcess(cmd, 60000)
     return true
 end
 
@@ -405,7 +209,7 @@ local function voicevox_talk(text, output_path, speaker_id)
         'curl.exe -s -X POST "%s/audio_query?speaker=%d&text=%s" -o "%s"',
         CONFIG.VOICEVOX_URL, speaker_id, url_encode(text), FILES.response
     )
-    exec_curl(cmd, 30000)
+    reaper.ExecProcess(cmd, 30000)
 
     local content = read_file(FILES.response)
     if not content or content:find('"detail"') then
@@ -419,7 +223,7 @@ local function voicevox_talk(text, output_path, speaker_id)
         'curl.exe -s -X POST "%s/synthesis?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
         CONFIG.VOICEVOX_URL, speaker_id, FILES.modified, output_path
     )
-    exec_curl(cmd, 60000)
+    reaper.ExecProcess(cmd, 60000)
     return true
 end
 
@@ -437,14 +241,6 @@ local function get_target_track(source_track)
     end
 
     return target
-end
-
-local function get_selected_items()
-    local items = {}
-    for i = 0, reaper.CountSelectedMediaItems(0) - 1 do
-        table.insert(items, reaper.GetSelectedMediaItem(0, i))
-    end
-    return items
 end
 
 local function delete_item_at_position(track, position)
@@ -488,7 +284,7 @@ end
 --------------------------------------------------------------------------------
 
 local function process_sing_mode(take, item_name, bpm, ppq_per_qn, notes)
-    local lyrics = split_lyrics(item_name)
+    local lyrics = common.split_lyrics(item_name)
     log(string.format("ノート数: %d, 歌詞: %s", #notes, table.concat(lyrics, "")))
 
     -- シンガー選択
@@ -503,7 +299,7 @@ local function process_sing_mode(take, item_name, bpm, ppq_per_qn, notes)
     local output_path = string.format("%s%s_%s.wav", CONFIG.TEMP_DIR, char_name, style_name)
 
     -- クエリ生成
-    local query_json = build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
+    local query_json = common.build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
     log("送信JSON: " .. query_json)
 
     log("歌唱クエリ生成中...")
@@ -551,35 +347,21 @@ end
 --------------------------------------------------------------------------------
 
 local function main()
+    common.clear_log()
     log("=== VOICEVOX合成 ===")
 
     -- VOICEVOX起動確認
-    if not ensure_voicevox_running() then
+    if not common.ensure_voicevox_running() then
         return false
     end
 
     -- MIDIアイテム取得
-    local item = reaper.GetSelectedMediaItem(0, 0)
-    if not item then
-        log("エラー: MIDIアイテムを選択してください")
-        return false
-    end
-
-    local take = reaper.GetActiveTake(item)
-    if not take then
-        log("エラー: アクティブテイクがありません")
-        return false
-    end
-
-    local _, item_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
-    if item_name == "" then
-        log("エラー: アイテム名（歌詞/テキスト）が空です")
-        return false
-    end
+    local item, take, item_name = common.get_selected_midi_item()
+    if not item then return false end
 
     -- モード判定と処理
-    local bpm, ppq_per_qn = get_project_info(take)
-    local notes = get_midi_notes(take)
+    local bpm, ppq_per_qn = common.get_project_info(take)
+    local notes = common.get_midi_notes(take)
     local is_sing = #notes > 0
 
     log(string.format("BPM: %.1f, モード: %s", bpm, is_sing and "歌唱" or "トーク"))
@@ -600,7 +382,7 @@ local function main()
     local item_start = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
     local item_track = reaper.GetMediaItem_Track(item)
     local target_track = get_target_track(item_track)
-    local selected_items = get_selected_items()
+    local selected_items = common.get_selected_items()
 
     local insert_pos = item_start
     if is_sing and #notes > 0 then
