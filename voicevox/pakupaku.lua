@@ -330,6 +330,19 @@ local function get_or_create_mouth_track()
     return new_track
 end
 
+local function delete_items_in_range(track, start_time, end_time)
+    -- 範囲内のアイテムを削除（逆順で削除）
+    for i = reaper.CountTrackMediaItems(track) - 1, 0, -1 do
+        local item = reaper.GetTrackMediaItem(track, i)
+        local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        local item_end = item_pos + reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+        -- アイテムが範囲と重なっていれば削除
+        if item_pos < end_time and item_end > start_time then
+            reaper.DeleteTrackMediaItem(track, item)
+        end
+    end
+end
+
 local function insert_mouth_image(image_path, position, duration, track)
     local orig_cursor = reaper.GetCursorPosition()
 
@@ -429,6 +442,13 @@ local function main()
     -- REST_FRAMESの分を引く
     start_time = start_time - frames_to_seconds(CONFIG.REST_FRAMES)
 
+    -- 終了位置を計算（phonemesの合計時間）
+    local total_frames = 0
+    for _, p in ipairs(phonemes) do
+        total_frames = total_frames + p.frame_length
+    end
+    local end_time = start_time + frames_to_seconds(total_frames)
+
     -- 口パクトラック取得
     local video_track = get_or_create_mouth_track()
 
@@ -437,6 +457,9 @@ local function main()
 
     -- Undo開始
     reaper.Undo_BeginBlock()
+
+    -- 既存の口パク画像を削除
+    delete_items_in_range(video_track, start_time, end_time)
 
     -- 口画像を配置
     local current_time = start_time
