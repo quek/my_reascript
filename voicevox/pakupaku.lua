@@ -24,8 +24,8 @@ local CONFIG = {
 -- phoneme → 口画像ファイル名のマッピング
 local MOUTH_MAP = {
     -- 母音
-    a = "_あは.png",
-    i = "_んゅ.png",      -- 横に開く
+    a = "_おあー.png",
+    i = "_へひひ.png",      -- 横に開く
     u = "_お.png",        -- 唇をすぼめる
     e = "_えあー.png",
     o = "_お.png",
@@ -36,6 +36,9 @@ local MOUTH_MAP = {
     -- デフォルト（閉じた口）
     default = "_ほほえみ.png",
 }
+
+-- 母音セット（子音の場合は次の母音の口形状を使う）
+local VOWELS = { a = true, i = true, u = true, e = true, o = true, N = true }
 
 local FILES = {
     query = CONFIG.TEMP_DIR .. "pakupaku_query.json",
@@ -239,12 +242,16 @@ end
 --------------------------------------------------------------------------------
 
 local function is_voicevox_running()
+    local check_file = CONFIG.TEMP_DIR .. "voicevox_check.txt"
+    -- 古いキャッシュを削除
+    os.remove(check_file)
+
     local cmd = string.format(
-        'curl.exe -s --max-time 2 "%s/version" -o "%svoicevox_check.txt"',
-        CONFIG.VOICEVOX_URL, CONFIG.TEMP_DIR
+        'curl.exe -s --max-time 2 "%s/version" -o "%s"',
+        CONFIG.VOICEVOX_URL, check_file
     )
     reaper.ExecProcess(cmd, 5000)
-    local content = read_file(CONFIG.TEMP_DIR .. "voicevox_check.txt")
+    local content = read_file(check_file)
     return content and content:match('^"[%d%.]+') ~= nil
 end
 
@@ -436,11 +443,25 @@ local function main()
     local prev_phoneme = nil
     local prev_item = nil
 
-    for _, p in ipairs(phonemes) do
+    for i, p in ipairs(phonemes) do
         local duration = frames_to_seconds(p.frame_length)
 
+        -- 子音の場合は次の母音の口形状を使う
+        local effective_phoneme = p.phoneme
+        if not VOWELS[p.phoneme] and p.phoneme ~= "pau" and p.phoneme ~= "cl" then
+            -- 次のphonemeを探して母音なら使う
+            for j = i + 1, #phonemes do
+                if VOWELS[phonemes[j].phoneme] then
+                    effective_phoneme = phonemes[j].phoneme
+                    break
+                elseif phonemes[j].phoneme == "pau" or phonemes[j].phoneme == "cl" then
+                    break  -- 休符に到達したら停止
+                end
+            end
+        end
+
         -- 同じ口形状が連続する場合は結合
-        local mouth_file = get_mouth_image(p.phoneme)
+        local mouth_file = get_mouth_image(effective_phoneme)
         local prev_mouth_file = prev_phoneme and get_mouth_image(prev_phoneme) or nil
 
         if prev_item and mouth_file == prev_mouth_file then
@@ -452,7 +473,7 @@ local function main()
             prev_item = insert_mouth_image(mouth_file, current_time, duration, video_track)
         end
 
-        prev_phoneme = p.phoneme
+        prev_phoneme = effective_phoneme
         current_time = current_time + duration
     end
 
