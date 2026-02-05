@@ -396,6 +396,8 @@ local function main()
 end
 
 -- 実行（エラー時のみログ表示）
-if main() == false then
-    show_log()
-end
+reaper.defer(function()
+    if main() == false then
+        show_log()
+    end
+end)
