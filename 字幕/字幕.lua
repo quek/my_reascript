@@ -8,6 +8,15 @@ local last_notes = {}  -- トラックGUIDをキーにしたノートのキャ�
 -- トグルアクションとして登録（再実行で自動終了）
 reaper.set_action_options(1)
 
+-- ツールバーボタンの状態を管理
+local _, _, sectionID, cmdID = reaper.get_action_context()
+reaper.SetToggleCommandState(sectionID, cmdID, 1)
+reaper.RefreshToolbar2(sectionID, cmdID)
+reaper.atexit(function()
+    reaper.SetToggleCommandState(sectionID, cmdID, 0)
+    reaper.RefreshToolbar2(sectionID, cmdID)
+end)
+
 --------------------------------------------------------------------------------
 -- トラック検索
 --------------------------------------------------------------------------------
