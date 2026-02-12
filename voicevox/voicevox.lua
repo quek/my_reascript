@@ -254,7 +254,7 @@ local function delete_item_at_position(track, position)
     end
 end
 
-local function insert_wav(wav_path, position, track, apply_offset, restore_items)
+local function insert_wav(wav_path, position, track, apply_offset, restore_items, snap_offset)
     local orig_cursor = reaper.GetCursorPosition()
     local insert_pos = apply_offset and position - frames_to_seconds(CONFIG.REST_FRAMES) or position
 
@@ -270,6 +270,18 @@ local function insert_wav(wav_path, position, track, apply_offset, restore_items
 
     -- 設定を復元
     reaper.SNM_SetIntConfigVar("showpeaksbuild", orig_showpeaks)
+
+    -- スナップオフセットを設定（MIDIアイテム開始位置に合わせる）
+    if snap_offset and snap_offset > 0 then
+        for i = 0, reaper.CountTrackMediaItems(track) - 1 do
+            local check_item = reaper.GetTrackMediaItem(track, i)
+            local pos = reaper.GetMediaItemInfo_Value(check_item, "D_POSITION")
+            if math.abs(pos - insert_pos) < 0.001 then
+                reaper.SetMediaItemInfo_Value(check_item, "D_SNAPOFFSET", snap_offset)
+                break
+            end
+        end
+    end
 
     -- 選択状態を復元
     reaper.SelectAllMediaItems(0, false)
@@ -389,7 +401,14 @@ local function main()
         insert_pos = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
     end
 
-    insert_wav(output_path, insert_pos, target_track, is_sing, selected_items)
+    -- MIDIアイテム開始位置をスナップオフセットに設定
+    local snap_offset = 0
+    if is_sing then
+        local actual_wav_pos = insert_pos - frames_to_seconds(CONFIG.REST_FRAMES)
+        snap_offset = math.max(0, item_start - actual_wav_pos)
+    end
+
+    insert_wav(output_path, insert_pos, target_track, is_sing, selected_items, snap_offset)
 
     log("完了！")
     return true
