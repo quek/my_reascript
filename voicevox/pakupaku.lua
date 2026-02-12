@@ -14,7 +14,9 @@ local log = common.log
 local show_log = common.show_log
 local read_file = common.read_file
 local write_file = common.write_file
+local url_encode = common.url_encode
 local frames_to_seconds = common.frames_to_seconds
+local seconds_to_frames = common.seconds_to_frames
 
 --------------------------------------------------------------------------------
 -- 口パク固有設定
@@ -42,6 +44,7 @@ local VOWELS = { a = true, i = true, u = true, e = true, o = true, N = true }
 local FILES = {
     query = CONFIG.TEMP_DIR .. "pakupaku_query.json",
     response = CONFIG.TEMP_DIR .. "pakupaku_response.json",
+    last_speaker = CONFIG.TEMP_DIR .. "voicevox_last_speaker.txt",
 }
 
 --------------------------------------------------------------------------------
@@ -87,6 +90,95 @@ local function parse_phonemes(json)
     return phonemes
 end
 
+local function parse_talk_phonemes(json)
+    local phonemes = {}
+
+    -- prePhonemeLength
+    local pre = tonumber(json:match('"prePhonemeLength"%s*:%s*([%d%.]+)'))
+    if pre and pre > 0 then
+        table.insert(phonemes, {phoneme = "pau", frame_length = seconds_to_frames(pre)})
+    end
+
+    -- accent_phrases配列を取得
+    local ap_array_start = json:find('"accent_phrases"%s*:%s*%[')
+    if ap_array_start then
+        local bracket_pos = json:find('%[', ap_array_start)
+        local depth = 0
+        local ap_array_end
+        for i = bracket_pos, #json do
+            local c = json:sub(i, i)
+            if c == '[' then depth = depth + 1
+            elseif c == ']' then
+                depth = depth - 1
+                if depth == 0 then ap_array_end = i; break end
+            end
+        end
+
+        if ap_array_end then
+            local ap_json = json:sub(bracket_pos + 1, ap_array_end - 1)
+            local pos = 1
+
+            while pos <= #ap_json do
+                -- moras配列を探す
+                local moras_start = ap_json:find('"moras"%s*:%s*%[', pos)
+                if not moras_start then break end
+
+                local moras_bracket = ap_json:find('%[', moras_start)
+                depth = 0
+                local moras_end
+                for i = moras_bracket, #ap_json do
+                    local c = ap_json:sub(i, i)
+                    if c == '[' then depth = depth + 1
+                    elseif c == ']' then
+                        depth = depth - 1
+                        if depth == 0 then moras_end = i; break end
+                    end
+                end
+                if not moras_end then break end
+
+                -- 各moraオブジェクトを処理
+                local moras_content = ap_json:sub(moras_bracket + 1, moras_end - 1)
+                for mora_block in moras_content:gmatch('%{[^%}]+%}') do
+                    local consonant = mora_block:match('"consonant"%s*:%s*"([^"]+)"')
+                    local consonant_length = tonumber(mora_block:match('"consonant_length"%s*:%s*([%d%.]+)'))
+                    local vowel = mora_block:match('"vowel"%s*:%s*"([^"]+)"')
+                    local vowel_length = tonumber(mora_block:match('"vowel_length"%s*:%s*([%d%.]+)'))
+
+                    if consonant and consonant_length then
+                        table.insert(phonemes, {phoneme = consonant, frame_length = seconds_to_frames(consonant_length)})
+                    end
+                    if vowel and vowel_length then
+                        table.insert(phonemes, {phoneme = vowel, frame_length = seconds_to_frames(vowel_length)})
+                    end
+                end
+
+                -- pause_moraを探す（moras配列の後、次のaccent_phraseの前）
+                local next_moras = ap_json:find('"moras"%s*:', moras_end + 1)
+                local search_end = next_moras and next_moras - 1 or #ap_json
+                local pause_region = ap_json:sub(moras_end + 1, search_end)
+
+                local pause_match = pause_region:match('"pause_mora"%s*:%s*(%{[^%}]+%})')
+                if pause_match then
+                    local pause_vowel_length = tonumber(pause_match:match('"vowel_length"%s*:%s*([%d%.]+)'))
+                    if pause_vowel_length then
+                        table.insert(phonemes, {phoneme = "pau", frame_length = seconds_to_frames(pause_vowel_length)})
+                    end
+                end
+
+                pos = moras_end + 1
+            end
+        end
+    end
+
+    -- postPhonemeLength
+    local post = tonumber(json:match('"postPhonemeLength"%s*:%s*([%d%.]+)'))
+    if post and post > 0 then
+        table.insert(phonemes, {phoneme = "pau", frame_length = seconds_to_frames(post)})
+    end
+
+    return phonemes
+end
+
 --------------------------------------------------------------------------------
 -- VOICEVOX API
 --------------------------------------------------------------------------------
@@ -97,6 +189,27 @@ local function voicevox_sing_query(json_body)
     local cmd = string.format(
         'curl.exe -s -X POST "%s/sing_frame_audio_query?speaker=%d" -H "Content-Type: application/json" --data-binary "@%s" -o "%s"',
         CONFIG.VOICEVOX_URL, CONFIG.QUERY_SPEAKER, FILES.query, FILES.response
+    )
+    reaper.ExecProcess(cmd, 30000)
+
+    local content = read_file(FILES.response)
+    if not content or content:find('"detail"') then
+        return nil
+    end
+
+    return content
+end
+
+local function get_talk_speaker_id()
+    local content = read_file(FILES.last_speaker)
+    local id = content and tonumber(content)
+    return id or 3
+end
+
+local function voicevox_talk_query(text, speaker_id)
+    local cmd = string.format(
+        'curl.exe -s -X POST "%s/audio_query?speaker=%d&text=%s" -o "%s"',
+        CONFIG.VOICEVOX_URL, speaker_id, url_encode(text), FILES.response
     )
     reaper.ExecProcess(cmd, 30000)
 
@@ -233,43 +346,56 @@ local function main()
     -- MIDI情報取得
     local bpm, ppq_per_qn = common.get_project_info(take)
     local notes = common.get_midi_notes(take)
+    local is_sing = #notes > 0
 
-    if #notes == 0 then
-        log("エラー: MIDIノートがありません")
-        return false
-    end
-
-    local lyrics = common.split_lyrics(item_name)
-    log(string.format("BPM: %.1f, ノート数: %d, 歌詞: %s", bpm, #notes, table.concat(lyrics, "")))
-
-    -- クエリJSON生成
-    local query_json = common.build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
-    log("クエリ送信中...")
-
-    -- VOICEVOXでphoneme情報取得
-    local response = voicevox_sing_query(query_json)
-    if not response then
-        log("エラー: VOICEVOX APIエラー")
-        return false
-    end
-
-    -- phoneme解析
-    local phonemes = parse_phonemes(response)
-    if #phonemes == 0 then
-        log("エラー: phoneme情報が取得できませんでした")
-        return false
-    end
-
-    log(string.format("phoneme数: %d", #phonemes))
+    log(string.format("BPM: %.1f, モード: %s", bpm, is_sing and "歌唱" or "トーク"))
 
     -- MIDIアイテムの開始・終了位置
     local item_start = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
     local item_length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
     local item_end = item_start + item_length
 
-    -- phonemesの配置開始位置（最初のノートの位置からREST_FRAMESを引く）
-    local first_note_time = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
-    local phoneme_start_time = first_note_time - frames_to_seconds(CONFIG.REST_FRAMES)
+    local phonemes, phoneme_start_time
+
+    if is_sing then
+        -- 歌唱モード
+        local lyrics = common.split_lyrics(item_name)
+        log(string.format("ノート数: %d, 歌詞: %s", #notes, table.concat(lyrics, "")))
+
+        local query_json = common.build_sing_query_json(notes, lyrics, bpm, ppq_per_qn)
+        log("歌唱クエリ送信中...")
+
+        local response = voicevox_sing_query(query_json)
+        if not response then
+            log("エラー: VOICEVOX APIエラー")
+            return false
+        end
+
+        phonemes = parse_phonemes(response)
+        local first_note_time = reaper.MIDI_GetProjTimeFromPPQPos(take, notes[1].startppq)
+        phoneme_start_time = first_note_time - frames_to_seconds(CONFIG.REST_FRAMES)
+    else
+        -- トークモード
+        local speaker_id = get_talk_speaker_id()
+        log(string.format("テキスト: %s, スピーカーID: %d", item_name, speaker_id))
+        log("トーククエリ送信中...")
+
+        local response = voicevox_talk_query(item_name, speaker_id)
+        if not response then
+            log("エラー: VOICEVOX APIエラー")
+            return false
+        end
+
+        phonemes = parse_talk_phonemes(response)
+        phoneme_start_time = item_start
+    end
+
+    if #phonemes == 0 then
+        log("エラー: phoneme情報が取得できませんでした")
+        return false
+    end
+
+    log(string.format("phoneme数: %d", #phonemes))
 
     -- 口パクトラック取得
     local video_track = get_or_create_mouth_track()
