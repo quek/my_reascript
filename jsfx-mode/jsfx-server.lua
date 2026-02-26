@@ -1,240 +1,104 @@
--- jsfx-server.lua — REAPER background script for jsfx-mode Emacs integration
+-- jsfx-server.lua — REAPER background script for jsfx-mode
+--
+-- Auto-reloads JSFX when source files change on disk.
+-- Scans all tracks for loaded JSFX, watches their files, and
+-- reloads (offline/online toggle) when content changes.
 --
 -- Install:
---   1. Copy this file to <REAPER resource>/Scripts/jsfx-server.lua
---   2. Actions > Show action list > New action > Load ReaScript...
---   3. Select this script and run it
---   4. (Optional) Add to SWS Startup Actions for auto-start
---
--- Protocol:
---   File-based IPC via <script_dir>/jsfx-ipc/
---   Emacs writes cmd.txt, this script reads it, writes resp.txt
+--   1. Actions > Show action list > New action > Load ReaScript...
+--   2. Select this script and run it (re-run to stop)
+--   3. (Optional) Add to SWS Startup Actions for auto-start
 
-local SCRIPT_NAME = "jsfx-server"
-local _, script_path, sectionID, cmdID = reaper.get_action_context()
-local script_dir = script_path:match("(.+)[/\\]")
-local IPC_DIR = script_dir .. "/jsfx-ipc/"
-local CMD_FILE = IPC_DIR .. "cmd.txt"
-local RESP_FILE = IPC_DIR .. "resp.txt"
-local STATUS_FILE = IPC_DIR .. "status.txt"
-local POLL_INTERVAL = 0.05 -- seconds
+local _, _, sectionID, cmdID = reaper.get_action_context()
 
--- トグルアクションとして登録（再実行で自動終了）
+-- Toggle action (re-run to stop)
 reaper.set_action_options(1)
 
--- ツールバーボタンの状態を管理
 reaper.SetToggleCommandState(sectionID, cmdID, 1)
 reaper.RefreshToolbar2(sectionID, cmdID)
 reaper.atexit(function()
-  os.remove(STATUS_FILE)
-  os.remove(CMD_FILE)
-  os.remove(RESP_FILE)
   reaper.SetToggleCommandState(sectionID, cmdID, 0)
   reaper.RefreshToolbar2(sectionID, cmdID)
 end)
 
--- Create IPC directory
-reaper.RecursiveCreateDirectory(IPC_DIR, 0)
-
 ----------------------------------------------------------------
--- Utility
+-- File watching — auto-reload JSFX on file change
 ----------------------------------------------------------------
 
-local function write_file(path, text)
-  local tmp = path .. ".tmp"
-  local f = io.open(tmp, "w")
-  if not f then return false end
-  f:write(text)
-  f:close()
-  os.remove(path)
-  os.rename(tmp, path)
-  return true
+local effects_dir = reaper.GetResourcePath() .. "/Effects/"
+local watched = {}          -- path -> content hash
+local loaded_jsfx = nil     -- path -> { {track, fx}, ... }
+local last_scan = 0
+local last_check = 0
+local SCAN_INTERVAL = 2     -- rebuild watch list (seconds)
+local CHECK_INTERVAL = 1    -- check file content (seconds)
+
+local function resolve_path(rel)
+  rel = rel:gsub("\\", "/")
+  for _, path in ipairs({
+    effects_dir .. rel,
+    effects_dir .. rel .. ".jsfx",
+  }) do
+    if reaper.file_exists(path) then return path end
+  end
 end
 
-local function read_and_delete(path)
-  local f = io.open(path, "r")
+local function file_hash(path)
+  local f = io.open(path, "rb")
   if not f then return nil end
   local content = f:read("*a")
   f:close()
-  os.remove(path)
-  return content
+  -- FNV-1a inspired hash
+  local h = 2166136261
+  for i = 1, #content do
+    h = ((h ~ content:byte(i)) * 16777619) % 4294967296
+  end
+  return h
 end
 
-local function write_status()
-  write_file(STATUS_FILE, "running\n" .. os.time() .. "\n" .. reaper.GetAppVersion() .. "\n")
-end
-
-----------------------------------------------------------------
--- Find JSFX on all tracks by filename substring
-----------------------------------------------------------------
-
-local function find_jsfx(search)
-  local results = {}
-  if not search or search == "" then return results end
-  search = search:lower()
-  local num_tracks = reaper.CountTracks(0)
-  for t = 0, num_tracks - 1 do
-    local track = reaper.GetTrack(0, t)
-    local fx_count = reaper.TrackFX_GetCount(track)
-    for fx = 0, fx_count - 1 do
+local function scan_loaded_jsfx()
+  local result = {}
+  local function scan(track)
+    for fx = 0, reaper.TrackFX_GetCount(track) - 1 do
       local _, name = reaper.TrackFX_GetFXName(track, fx, "")
-      if name:lower():find(search, 1, true) then
-        table.insert(results, { track = track, fx = fx, name = name, track_idx = t })
+      if name and name:sub(1, 3) == "JS:" then
+        local ok, ident = reaper.TrackFX_GetNamedConfigParm(track, fx, "fx_ident")
+        if ok then
+          local path = resolve_path(ident)
+          if path then
+            if not result[path] then result[path] = {} end
+            result[path][#result[path] + 1] = { track = track, fx = fx }
+          end
+        end
       end
     end
   end
-  -- Also check monitoring FX
-  local mon_count = reaper.TrackFX_GetCount(reaper.GetMasterTrack(0))
-  local master = reaper.GetMasterTrack(0)
-  for fx = 0, mon_count - 1 do
-    local _, name = reaper.TrackFX_GetFXName(master, fx, "")
-    if name:lower():find(search, 1, true) then
-      table.insert(results, { track = master, fx = fx, name = name, track_idx = -1 })
-    end
+  for t = 0, reaper.CountTracks(0) - 1 do
+    scan(reaper.GetTrack(0, t))
   end
-  return results
+  scan(reaper.GetMasterTrack(0))
+  return result
 end
 
-----------------------------------------------------------------
--- Command handlers
-----------------------------------------------------------------
-
-local handlers = {}
-
-function handlers.PING()
-  return "OK " .. reaper.GetAppVersion()
-end
-
-function handlers.RELOAD(args)
-  -- Force JSFX recompile by toggling offline state
-  local matches = find_jsfx(args)
-  if #matches == 0 then
-    return "OK 0"
-  end
-  for _, m in ipairs(matches) do
-    reaper.TrackFX_SetOffline(m.track, m.fx, true)
-    reaper.TrackFX_SetOffline(m.track, m.fx, false)
-  end
-  return "OK " .. #matches
-end
-
-function handlers.FXLIST(args)
-  -- List all FX on selected track (or all tracks if args == "all")
-  local lines = {}
-  if args == "all" then
-    local num_tracks = reaper.CountTracks(0)
-    for t = 0, num_tracks - 1 do
-      local track = reaper.GetTrack(0, t)
-      local _, track_name = reaper.GetTrackName(track)
-      local fx_count = reaper.TrackFX_GetCount(track)
-      for fx = 0, fx_count - 1 do
-        local _, name = reaper.TrackFX_GetFXName(track, fx, "")
-        local enabled = reaper.TrackFX_GetEnabled(track, fx)
-        local offline = reaper.TrackFX_GetOffline(track, fx)
-        local status = offline and "offline" or (enabled and "on" or "bypass")
-        table.insert(lines, t .. "\t" .. track_name .. "\t" .. fx .. "\t" .. name .. "\t" .. status)
+local function check_file_changes()
+  if not loaded_jsfx then return end
+  for path, fxlist in pairs(loaded_jsfx) do
+    local h = file_hash(path)
+    if h then
+      if watched[path] == nil then
+        watched[path] = h
+      elseif watched[path] ~= h then
+        watched[path] = h
+        for _, info in ipairs(fxlist) do
+          reaper.TrackFX_SetOffline(info.track, info.fx, true)
+          reaper.TrackFX_SetOffline(info.track, info.fx, false)
+        end
       end
     end
-  else
-    local track = reaper.GetSelectedTrack(0, 0)
-    if not track then
-      return "ERR No track selected"
-    end
-    local fx_count = reaper.TrackFX_GetCount(track)
-    for fx = 0, fx_count - 1 do
-      local _, name = reaper.TrackFX_GetFXName(track, fx, "")
-      local enabled = reaper.TrackFX_GetEnabled(track, fx)
-      local offline = reaper.TrackFX_GetOffline(track, fx)
-      local status = offline and "offline" or (enabled and "on" or "bypass")
-      table.insert(lines, fx .. "\t" .. name .. "\t" .. status)
-    end
   end
-  return "OK\n" .. table.concat(lines, "\n")
-end
-
-function handlers.FXPARAMS(args)
-  -- Get parameter names and values: FXPARAMS <fx_index> [track_index]
-  local parts = {}
-  for w in args:gmatch("%S+") do table.insert(parts, w) end
-  local fx_idx = tonumber(parts[1])
-  local track_idx = tonumber(parts[2])
-  if not fx_idx then
-    return "ERR Invalid FX index"
-  end
-  local track
-  if track_idx then
-    if track_idx < 0 then
-      track = reaper.GetMasterTrack(0)
-    else
-      track = reaper.GetTrack(0, track_idx)
-    end
-  else
-    track = reaper.GetSelectedTrack(0, 0)
-  end
-  if not track then
-    return "ERR No track"
-  end
-  local lines = {}
-  local num_params = reaper.TrackFX_GetNumParams(track, fx_idx)
-  for p = 0, num_params - 1 do
-    local _, pname = reaper.TrackFX_GetParamName(track, fx_idx, p, "")
-    local val, minval, maxval = reaper.TrackFX_GetParam(track, fx_idx, p)
-    local _, formatted = reaper.TrackFX_GetFormattedParamValue(track, fx_idx, p, "")
-    table.insert(lines, p .. "\t" .. pname .. "\t" .. val .. "\t" .. minval .. "\t" .. maxval .. "\t" .. formatted)
-  end
-  return "OK\n" .. table.concat(lines, "\n")
-end
-
-function handlers.SETPARAM(args)
-  -- Set parameter value: SETPARAM <fx_index> <param_index> <value> [track_index]
-  local parts = {}
-  for w in args:gmatch("%S+") do table.insert(parts, w) end
-  local fx_idx = tonumber(parts[1])
-  local param_idx = tonumber(parts[2])
-  local value = tonumber(parts[3])
-  local track_idx = tonumber(parts[4])
-  if not fx_idx or not param_idx or not value then
-    return "ERR Invalid arguments"
-  end
-  local track
-  if track_idx then
-    track = track_idx < 0 and reaper.GetMasterTrack(0) or reaper.GetTrack(0, track_idx)
-  else
-    track = reaper.GetSelectedTrack(0, 0)
-  end
-  if not track then return "ERR No track" end
-  reaper.TrackFX_SetParam(track, fx_idx, param_idx, value)
-  return "OK"
-end
-
-function handlers.STOP()
-  -- Graceful shutdown
-  os.remove(STATUS_FILE)
-  os.remove(CMD_FILE)
-  os.remove(RESP_FILE)
-  return "OK STOPPED"
-end
-
-----------------------------------------------------------------
--- Command dispatcher
-----------------------------------------------------------------
-
-local function process_line(line)
-  line = line:match("^%s*(.-)%s*$") -- trim
-  if not line or line == "" then return end
-  local cmd, args = line:match("^(%S+)%s*(.*)")
-  if not cmd then return end
-  cmd = cmd:upper()
-  local handler = handlers[cmd]
-  if handler then
-    local ok, result = pcall(handler, args)
-    if ok then
-      write_file(RESP_FILE, result or "OK")
-    else
-      write_file(RESP_FILE, "ERR " .. tostring(result))
-    end
-  else
-    write_file(RESP_FILE, "ERR Unknown: " .. cmd)
+  -- Clean up unloaded FX
+  for path in pairs(watched) do
+    if not loaded_jsfx[path] then watched[path] = nil end
   end
 end
 
@@ -242,23 +106,22 @@ end
 -- Main loop
 ----------------------------------------------------------------
 
-local stop = false
-
 local function main()
-  write_status()
-  local content = read_and_delete(CMD_FILE)
-  if content and content ~= "" then
-    for line in content:gmatch("[^\n]+") do
-      process_line(line)
-      if line:upper():match("^STOP") then
-        stop = true
-      end
-    end
+  local now = reaper.time_precise()
+
+  -- Scan loaded JSFX
+  if now - last_scan >= SCAN_INTERVAL then
+    last_scan = now
+    loaded_jsfx = scan_loaded_jsfx()
   end
-  if not stop then
-    reaper.defer(main)
+
+  -- Check for file changes
+  if now - last_check >= CHECK_INTERVAL then
+    last_check = now
+    check_file_changes()
   end
+
+  reaper.defer(main)
 end
 
--- reaper.ShowConsoleMsg("[" .. SCRIPT_NAME .. "] Started. IPC dir: " .. IPC_DIR .. "\n")
 main()

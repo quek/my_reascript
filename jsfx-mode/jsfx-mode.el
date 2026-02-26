@@ -18,21 +18,15 @@
 ;;       * All built-in functions and special variables
 ;;       * Functions from imported .jsfx-inc files (auto-parsed)
 ;;       * Slider variable names from file headers
-;;   - REAPER integration (optional, via jsfx-server.lua):
-;;       * Auto-reload JSFX on save
-;;       * Query FX parameters from running REAPER
-;;       * Interactive commands: M-x jsfx-reaper-*
 ;;   - File associations for .jsfx and .jsfx-inc
 ;;
 ;; Installation:
 ;;   (add-to-list 'load-path "/path/to/directory/")
 ;;   (require 'jsfx-mode)
 ;;
-;; REAPER Integration:
-;;   1. Load jsfx-server.lua as a ReaScript action in REAPER
-;;   2. Run the action to start the IPC server
-;;   3. M-x jsfx-reaper-ping to verify connection
-;;   4. Set jsfx-auto-reload to t (default) for reload on save
+;; Auto-reload:
+;;   Load jsfx-server.lua as a ReaScript action in REAPER.
+;;   It watches loaded JSFX files and auto-reloads on change.
 
 ;;; Code:
 
@@ -51,21 +45,10 @@
   :group 'jsfx
   :safe #'integerp)
 
-(defcustom jsfx-auto-reload t
-  "When non-nil, notify REAPER to reload JSFX after saving.
-Requires jsfx-server.lua running in REAPER."
-  :type 'boolean
-  :group 'jsfx)
-
 (defcustom jsfx-reaper-resource-path nil
   "Path to REAPER resource directory.
 If nil, auto-detected from the buffer file path (looks for Effects/ ancestor)."
   :type '(choice (const nil) directory)
-  :group 'jsfx)
-
-(defcustom jsfx-ipc-timeout 2.0
-  "Timeout in seconds for REAPER IPC commands."
-  :type 'number
   :group 'jsfx)
 
 ;; ============================================================
@@ -451,137 +434,8 @@ Combines built-in functions, imported functions, and slider variables."
             :exclusive 'no))))
 
 ;; ============================================================
-;;; REAPER IPC
-;; ============================================================
-
-(defconst jsfx--mode-directory
-  (file-name-directory (or load-file-name buffer-file-name))
-  "Directory where jsfx-mode.el is located.")
-
-(defun jsfx--ipc-dir ()
-  "Return the IPC directory path for REAPER communication."
-  (expand-file-name "jsfx-ipc/" jsfx--mode-directory))
-
-(defun jsfx--server-running-p ()
-  "Return non-nil if jsfx-server.lua appears to be running in REAPER."
-  (let ((ipc (jsfx--ipc-dir)))
-    (when ipc
-      (let ((status-file (expand-file-name "status.txt" ipc)))
-        (when (file-exists-p status-file)
-          ;; Check that the status file was updated within the last 5 seconds
-          (let* ((attrs (file-attributes status-file))
-                 (mtime (float-time (file-attribute-modification-time attrs)))
-                 (age (- (float-time) mtime)))
-            (< age 5.0)))))))
-
-(defun jsfx--send-command (cmd &optional timeout)
-  "Send CMD string to REAPER server, wait for response.
-TIMEOUT defaults to `jsfx-ipc-timeout'.
-Returns response string or nil on timeout."
-  (let* ((timeout (or timeout jsfx-ipc-timeout))
-         (ipc (jsfx--ipc-dir))
-         (cmd-file (expand-file-name "cmd.txt" ipc))
-         (resp-file (expand-file-name "resp.txt" ipc)))
-    (unless ipc
-      (error "Cannot determine REAPER resource path"))
-    ;; Ensure IPC directory exists
-    (make-directory ipc t)
-    ;; Clear old response
-    (when (file-exists-p resp-file)
-      (delete-file resp-file))
-    ;; Write command atomically (write .tmp then rename)
-    (let ((tmp (concat cmd-file ".tmp")))
-      (with-temp-file tmp
-        (insert cmd "\n"))
-      (rename-file tmp cmd-file t))
-    ;; Poll for response
-    (let ((start (float-time))
-          result)
-      (while (and (not result)
-                  (< (- (float-time) start) timeout))
-        (sleep-for 0.05)
-        (when (file-exists-p resp-file)
-          (setq result
-                (with-temp-buffer
-                  (insert-file-contents resp-file)
-                  (buffer-string)))
-          (delete-file resp-file)))
-      result)))
-
-;; ============================================================
-;;; REAPER interactive commands
-;; ============================================================
-
-(defun jsfx-reaper-ping ()
-  "Check if REAPER jsfx-server is running."
-  (interactive)
-  (let ((resp (jsfx--send-command "PING" 3.0)))
-    (if resp
-        (message "REAPER: %s" resp)
-      (message "REAPER: no response (is jsfx-server.lua running?)"))))
-
-(defun jsfx-reaper-reload ()
-  "Force REAPER to reload the current JSFX file."
-  (interactive)
-  (let* ((name (file-name-sans-extension
-                (file-name-nondirectory (or buffer-file-name ""))))
-         (resp (jsfx--send-command (concat "RELOAD " name))))
-    (if resp
-        (message "Reload: %s" resp)
-      (message "Reload: no response from REAPER"))))
-
-(defun jsfx-reaper-fx-list ()
-  "Show FX list on the selected track in REAPER."
-  (interactive)
-  (let ((resp (jsfx--send-command "FXLIST")))
-    (if (and resp (string-prefix-p "OK" resp))
-        (with-output-to-temp-buffer "*JSFX FX List*"
-          (princ (substring resp 3)))
-      (message "FX List: %s" (or resp "no response")))))
-
-(defun jsfx-reaper-fx-params (fx-index)
-  "Show parameters for FX at FX-INDEX on selected track."
-  (interactive "nFX index: ")
-  (let ((resp (jsfx--send-command (format "FXPARAMS %d" fx-index))))
-    (if (and resp (string-prefix-p "OK" resp))
-        (with-output-to-temp-buffer "*JSFX FX Params*"
-          (princ "Idx\tName\tValue\tMin\tMax\tFormatted\n")
-          (princ (make-string 60 ?-))
-          (princ "\n")
-          (princ (substring resp 3)))
-      (message "FX Params: %s" (or resp "no response")))))
-
-(defun jsfx-reaper-stop-server ()
-  "Stop the jsfx-server running in REAPER."
-  (interactive)
-  (let ((resp (jsfx--send-command "STOP" 3.0)))
-    (message "Stop: %s" (or resp "no response"))))
-
-;; ============================================================
-;;; After-save hook — auto-reload
-;; ============================================================
-
-(defun jsfx--after-save-hook ()
-  "Notify REAPER to reload this JSFX after save."
-  (when (and jsfx-auto-reload
-             (jsfx--server-running-p))
-    (let* ((name (file-name-sans-extension
-                  (file-name-nondirectory buffer-file-name)))
-           (resp (jsfx--send-command (concat "RELOAD " name) 1.0)))
-      (when resp
-        (message "REAPER reload: %s" resp)))))
-
-;; ============================================================
 ;;; Mode definition
 ;; ============================================================
-
-(defvar jsfx-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-c C-r") #'jsfx-reaper-reload)
-    (define-key map (kbd "C-c C-p") #'jsfx-reaper-ping)
-    (define-key map (kbd "C-c C-l") #'jsfx-reaper-fx-list)
-    map)
-  "Keymap for `jsfx-mode'.")
 
 ;;;###autoload
 (define-derived-mode jsfx-mode prog-mode "JSFX"
@@ -589,15 +443,7 @@ Returns response string or nil on timeout."
 
 JSFX uses EEL2 scripting language with parenthesis-based code blocks.
 This mode provides syntax highlighting, automatic indentation,
-context-aware completion, and optional REAPER integration.
-
-Key bindings:
-\\<jsfx-mode-map>
-  \\[jsfx-reaper-reload]  Force reload in REAPER
-  \\[jsfx-reaper-ping]    Ping REAPER server
-  \\[jsfx-reaper-fx-list] Show FX list
-
-\\{jsfx-mode-map}"
+and context-aware completion."
   :syntax-table jsfx-mode-syntax-table
   :group 'jsfx
 
@@ -620,9 +466,6 @@ Key bindings:
 
   ;; Completion
   (add-hook 'completion-at-point-functions #'jsfx-completion-at-point nil t)
-
-  ;; Auto-reload on save
-  (add-hook 'after-save-hook #'jsfx--after-save-hook nil t)
 
   ;; Paragraph handling (sections start new paragraphs)
   (setq-local paragraph-start (concat "\\|@\\|" page-delimiter))
