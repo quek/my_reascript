@@ -11,13 +11,27 @@
 --   Emacs writes cmd.txt, this script reads it, writes resp.txt
 
 local SCRIPT_NAME = "jsfx-server"
-local _, script_path = reaper.get_action_context()
+local _, script_path, sectionID, cmdID = reaper.get_action_context()
 local script_dir = script_path:match("(.+)[/\\]")
 local IPC_DIR = script_dir .. "/jsfx-ipc/"
 local CMD_FILE = IPC_DIR .. "cmd.txt"
 local RESP_FILE = IPC_DIR .. "resp.txt"
 local STATUS_FILE = IPC_DIR .. "status.txt"
 local POLL_INTERVAL = 0.05 -- seconds
+
+-- トグルアクションとして登録（再実行で自動終了）
+reaper.set_action_options(1)
+
+-- ツールバーボタンの状態を管理
+reaper.SetToggleCommandState(sectionID, cmdID, 1)
+reaper.RefreshToolbar2(sectionID, cmdID)
+reaper.atexit(function()
+  os.remove(STATUS_FILE)
+  os.remove(CMD_FILE)
+  os.remove(RESP_FILE)
+  reaper.SetToggleCommandState(sectionID, cmdID, 0)
+  reaper.RefreshToolbar2(sectionID, cmdID)
+end)
 
 -- Create IPC directory
 reaper.RecursiveCreateDirectory(IPC_DIR, 0)
